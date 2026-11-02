@@ -2,7 +2,7 @@
   "name": "cppo",
   "displayName": "CPPO — Claude Parallel Profile Orchestration",
   "description": "Make Claude Code the lead of a multi-model team: delegate answers and sandboxed agent tasks to GLM, GPT (Codex) and Claude across the services you use, routed by roles with fallbacks and reviewed before they land — plus a Claude account per VS Code window, with one shared history.",
-  "version": "1.18.2",
+  "version": "1.19.0",
   "publisher": "BeboutItSolutions",
   "icon": "images/icon.png",
   "repository": {

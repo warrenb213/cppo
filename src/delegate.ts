@@ -5,6 +5,7 @@ import * as http from 'http';
 import * as crypto from 'crypto';
 import { spawn } from 'child_process';
 import { claudeShellArgs } from './cli';
+import { decideStop, readTranscriptTail, sessionTasks } from './handoff';
 import { log } from './log';
 import { TASK_LIMITS, type AgentTasks } from './agentTasks';
 import { UsageBook, zaiQuota, fromRateLimitInfo, claudeCodeUsage } from './usage';
@@ -263,6 +264,7 @@ export class DelegateServer implements vscode.Disposable {
   /** Agent runs' token: consult and usage only — a worker can't start tasks. */
   private readonly workerToken = crypto.randomBytes(24).toString('hex');
   private calls = 0;
+  private readonly stopBlocks = new Map<string, number>();
   readonly usage = new UsageBook();
   /** This window's latest consultations, oldest first. */
   readonly consults: Consult[] = [];
@@ -298,8 +300,12 @@ export class DelegateServer implements vscode.Disposable {
           headers: { Authorization: `Bearer ${this.token}` },
           timeout: MCP_CALL_TIMEOUT_MS,
         });
+        registerStopHook(dir!, Boolean(this.agents) && this.source.workers().some((w) => w.agent));
       } else {
-        if (dir) register(dir, undefined);
+        if (dir) {
+          registerStopHook(dir, false);
+          register(dir, undefined);
+        }
         this.stop();
       }
     } catch (err) {
@@ -389,7 +395,8 @@ export class DelegateServer implements vscode.Disposable {
             'Where enabled, start_task runs one as an agent on a scratch worktree of the repo and returns a ' +
             'diff via wait_task; review it before apply_task_changes. Ask by `role` (list_roles: quick, ' +
             'second-opinion, review, hard-reasoning, implement, test-and-fix, vector-art, 2d-art) so the user\'s ' +
-            'choice of model, effort and fallbacks applies. Check workers\' output before relying on it.',
+            'choice of model, effort and fallbacks applies. Check workers\' output before relying on it. ' +
+            "After start_task, keep working: call wait_task (it waits up to 4 minutes) until every task you started is done, then review each diff and apply or report it; don't end your turn while tasks you started are still running.",
         });
       case 'ping':
         return reply({});
@@ -476,6 +483,11 @@ export class DelegateServer implements vscode.Disposable {
     const id = { type: 'string', description: 'The task_id start_task returned.' };
     return [
       {
+        name: 'stop_check',
+        description: "Internal: called by CPPO's Stop hook so a session isn't ended while its agent tasks run. Do not call it yourself.",
+        inputSchema: { type: 'object', properties: { transcript_path: { type: 'string' }, session_id: { type: 'string' }, stop_hook_active: { type: 'string' } } },
+      },
+      {
         name: 'start_task',
         description:
           'Start an agent task: a worker model (another provider the user enabled) runs headless on a scratch git ' +
@@ -485,7 +497,7 @@ export class DelegateServer implements vscode.Disposable {
           "(e.g. Claude on the user's subscription). Returns a task_id at once; tasks take minutes. The worker " +
           'sees only its copy and what you put in task/context: gitignored files (scratch folders, build output) ' +
           'are not in it unless listed in `include` — or named in task/context by absolute path, which copies ' +
-          'that file in. Get the result with wait_task.',
+          "that file in. Keep calling wait_task until it is done, then review the diff and apply or report it; don't end your turn while it runs.",
         inputSchema: {
           type: 'object',
           properties: {
@@ -559,6 +571,22 @@ export class DelegateServer implements vscode.Disposable {
 
   private async call(name: string, args: Json, caller: 'lead' | 'agent' = 'lead'): Promise<Json> {
     const text = (t: string, isError = false) => ({ content: [{ type: 'text', text: t }], ...(isError && { isError: true }) });
+    if (name === 'stop_check') {
+      try {
+        if (caller !== 'lead' || !this.agents || typeof args.transcript_path !== 'string' || !args.transcript_path) return text('{}');
+        const transcript = readTranscriptTail(args.transcript_path);
+        const key = typeof args.session_id === 'string' ? args.session_id : '';
+        const count = this.stopBlocks.get(key) ?? 0;
+        const decision = decideStop({ transcript, task: (id) => this.agents!.view(id), blocksInARow: count });
+        this.stopBlocks.set(key, decision.block ? count + 1 : 0);
+        if (!decision.block) return text('{}');
+        const tasks = sessionTasks(transcript).started.map((id) => this.agents!.view(id)).filter((t) => t !== undefined);
+        log(`workers: stop blocked (${count + 1}; ${tasks.length} tasks; workers: ${[...new Set(tasks.map((t) => t.worker))].join(', ')})`);
+        return text(JSON.stringify({ decision: 'block', reason: decision.reason }));
+      } catch {
+        return text('{}');
+      }
+    }
     if (name === 'list_workers') {
       const ws = this.source.workers();
       return text(ws.map((w) => `- ${w.id}: ${w.note} (${w.providerName}, model ${w.model})`).join('\n') || 'No workers are enabled.');
@@ -592,7 +620,7 @@ export class DelegateServer implements vscode.Disposable {
             `${r.queued ? 'Queued' : 'Started'} task ${r.id} on ${w.id}${after ? `, building on ${after}` : ''}` +
               `${r.queued ? (after ? ` — it starts when ${after} is done` : ' — it starts when a slot frees') : ''}. ` +
               `${routed.role ? ` Role ${routed.role}${effort ? `, effort ${effort}` : ''}${passed.length ? ` (${passed.join('; ')})` : ''}.` : ''}` +
-              ` Call wait_task with task_id "${r.id}" for its result.${r.note ? `\n\nSnapshot: ${r.note}` : ''}`
+              ` Don't end your turn while it runs: call wait_task with task_id "${r.id}" now (it waits up to 4 minutes) and keep calling it until the task is done, then review the diff and apply or report it.${r.note ? `\n\nSnapshot: ${r.note}` : ''}`
           );
         }
         if (name === 'wait_task') {
@@ -802,6 +830,7 @@ export class DelegateServer implements vscode.Disposable {
     const dir = this.configDir();
     if (dir) {
       try {
+        registerStopHook(dir, false);
         register(dir, undefined);
       } catch {
         /* best effort on shutdown */
@@ -839,4 +868,63 @@ function register(dir: string, entry: Json | undefined): void {
   const tmp = `${file}.${process.pid}.tmp`;
   fs.writeFileSync(tmp, JSON.stringify(config, null, 2), { mode: 0o600 });
   fs.renameSync(tmp, file);
+}
+
+/** Own only our handler: a user's other hooks must survive enable and disable. */
+export function registerStopHook(dir: string, on: boolean): void {
+  const file = path.join(dir, 'settings.json');
+  let tmp: string | undefined;
+  try {
+    let config: Json = {};
+    try {
+      const parsed = JSON.parse(fs.readFileSync(file, 'utf-8'));
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return;
+      config = parsed;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') return;
+    }
+    const object = (v: unknown): v is Json => Boolean(v) && typeof v === 'object' && !Array.isArray(v);
+    if (config.hooks !== undefined && !object(config.hooks)) return;
+    const hooks = (config.hooks ?? {}) as Json;
+    if (hooks.Stop !== undefined && !Array.isArray(hooks.Stop)) return;
+    const groups = (hooks.Stop ?? []) as unknown[];
+    const ours = (h: unknown): h is Json => object(h) && h.type === 'mcp_tool' && h.server === SERVER_NAME && h.tool === 'stop_check';
+    const handler = {
+      type: 'mcp_tool', server: SERVER_NAME, tool: 'stop_check',
+      input: { transcript_path: '${transcript_path}', session_id: '${session_id}', stop_hook_active: '${stop_hook_active}' },
+      timeout: 20,
+    };
+    const identical = (h: unknown) => ours(h) && h.timeout === handler.timeout && object(h.input) &&
+      Object.keys(h.input).length === 3 && Object.entries(handler.input).every(([k, v]) => (h.input as Json)[k] === v) && Object.keys(h).length === 5;
+    if (on && groups.some((g) => object(g) && Array.isArray(g.hooks) && g.hooks.some(identical))) return;
+    let changed = false;
+    const next: unknown[] = [];
+    for (const group of groups) {
+      if (!object(group) || !Array.isArray(group.hooks) || !group.hooks.some(ours)) {
+        next.push(group);
+        continue;
+      }
+      changed = true;
+      const remaining = group.hooks.filter((h) => !ours(h));
+      if (remaining.length) next.push({ ...group, hooks: remaining });
+    }
+    if (on) {
+      next.push({ hooks: [handler] });
+      changed = true;
+    }
+    if (!changed) return;
+    if (next.length) hooks.Stop = next;
+    else delete hooks.Stop;
+    if (Object.keys(hooks).length) config.hooks = hooks;
+    else delete config.hooks;
+    tmp = `${file}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(config, null, 2), { mode: 0o600 });
+    fs.renameSync(tmp, file);
+  } catch {
+    /* A hook is optional; an unreadable config must never prevent startup. */
+  } finally {
+    if (tmp) {
+      try { fs.unlinkSync(tmp); } catch { /* renamed or never written */ }
+    }
+  }
 }

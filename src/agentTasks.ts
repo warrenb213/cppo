@@ -3,6 +3,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as crypto from 'crypto';
 import { execFile, execFileSync, spawn, ChildProcess } from 'child_process';
+import type { TaskView } from './handoff';
 import { workingRoot } from './workdir';
 import { log } from './log';
 import { MCP_CALL_TIMEOUT_MS } from './delegate';
@@ -143,6 +144,9 @@ const INCLUDE_COUNT_MAX = 2_000;
  * test (GLM couldn't typecheck this very repo without node_modules). Top-level
  * only; each link is removed again before the changes are collected.
  */
+/** New files that are caches or build output, never the work — for runners that create files through the shell. */
+const CACHE_LIKE = /(^|\/)(__pycache__|node_modules|\.cache|\.pytest_cache|\.mypy_cache|\.ruff_cache|\.next|\.turbo|\.venv|venv|dist|build|target|coverage)\/|\.(pyc|pyo|o|obj|class|log|tmp|swp|orig|rej)$|~$/i;
+
 const DEP_DIRS = ['node_modules', '.venv', 'venv', '.virtualenv', 'vendor', '.bundle', 'bower_components', 'Pods', '.gradle'];
 
 /** The workers MCP server, as agent runs see it (restricted token: consult tools only). */
@@ -331,6 +335,16 @@ export class AgentTasks implements vscode.Disposable {
     private readonly onTaskDone?: (worker: string, inTok: number, outTok: number) => void
   ) {
     this.prune();
+  }
+
+  view(id: string): TaskView | undefined {
+    const t = this.tasks.get(id);
+    if (!t) return undefined;
+    return {
+      id: t.id, worker: t.worker, status: t.status,
+      minutes: Math.round(((t.ended ?? Date.now()) - t.started) / 60_000),
+      turns: t.turns, lastAction: t.lastAction, files: t.files?.length ?? 0, applied: Boolean(t.applied),
+    };
   }
 
   private root(): string {
@@ -986,7 +1000,11 @@ export class AgentTasks implements vscode.Disposable {
         const [code, file] = line.split('\t');
         // 2D art: images come from the image tool and get copied in by command — they ARE the work.
         const art = t.role === '2d-art' && /\.(png|jpe?g|webp|gif|svg)$/i.test(file);
-        if (code === 'A' && !t.written.has(file) && !art) t.sideEffects.push(file);
+        // Codex creates most files with shell heredocs and redirects, which never show up as edits — a
+        // new source file it made that way is the work (a task lost its whole new module this way). Its
+        // build output and caches are gitignored or match CACHE_LIKE; everything else new is kept.
+        const shellMade = t.runner === 'codex' && !CACHE_LIKE.test(file);
+        if (code === 'A' && !t.written.has(file) && !art && !shellMade) t.sideEffects.push(file);
         else included.push(file);
       }
       t.files = included;
@@ -1068,10 +1086,10 @@ export class AgentTasks implements vscode.Disposable {
     }
     const secs = Math.round(((t.ended ?? Date.now()) - t.started) / 1000);
     if (t.status === 'queued') {
-      return { text: `Task ${id} is queued${t.after ? ` — it starts when ${t.after} is done` : ' — waiting for a free slot'}. Call wait_task again.` };
+      return { text: `Task ${id} is queued${t.after ? ` — it starts when ${t.after} is done` : ' — waiting for a free slot'} — call wait_task again now.` };
     }
     if (t.status === 'running') {
-      return { text: `Task ${id} is still running (${secs} s, ${t.turns} turns, ${t.toolUses} tool calls; last: ${t.lastAction ?? '—'}). Call wait_task again.` };
+      return { text: `Task ${id} is still running (${secs} s, ${t.turns} turns, ${t.toolUses} tool calls; last: ${t.lastAction ?? '—'}). Still running — call wait_task again now; don't report to the user yet.` };
     }
     let diff = '';
     if (t.patchFile) {

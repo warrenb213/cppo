@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.19.0 — 2026-11-02
+
+### Added
+
+- **The lead keeps going while agent tasks run.** On one host, 248 of 381 `start_task` calls were followed by a turn that simply ended — nothing wakes the lead when a task finishes, so the user had to type "status" or "proceed". While agent workers are enabled, CPPO now registers a Claude Code **Stop hook** (`mcp_tool` type, calling a new `stop_check` tool on the workers server) in the window's `settings.json`. When the lead tries to stop with tasks *its own session* started still running — or finished but never read — the hook blocks the stop and tells it to `wait_task`; once everything is done and read, it lets go. Safeguards: it reads the session's transcript to know which tasks are its own, ignores tasks the window no longer knows (after a reload), doesn't fire on an Esc interrupt, stops blocking after 60 in a row, and removes itself (leaving your other hooks alone) when no agent worker is enabled. Verified live against Claude Code 2.1.303: without the hook the lead started a task and said "FINISHED" at 11 s with the task still running; with it the lead was blocked once, waited, and finished at 35 s with the real result.
+- Tighter wording the lead sees: `start_task`, `wait_task` ("still running — call wait_task again now") and the server instructions all say not to end the turn while tasks run.
+
+### Fixed
+
+- **New files Codex created through the shell were dropped from a task's result.** Codex writes most files with heredocs and redirects, which CPPO classed as "side effects of commands" and left out — a task's whole new module vanished from its diff. New files from Codex runs are now kept unless they look like caches or build output.
+
 ## 1.18.2 — 2026-10-22
 
 ### Fixed
