@@ -1,5 +1,24 @@
 # Changelog
 
+## 1.20.0 — 2026-11-02
+
+### Added
+
+- **Google AI (Antigravity) as a provider.** *Add a Provider → Google AI* adds the models your Google AI plan includes as workers, through Antigravity's own CLI (`agy`) — the plan is only ever used by its client, CPPO never reads its sign-in, and nothing is sent to Google by CPPO itself. Verified live on an AI Ultra 5x account: `agy models` gives Gemini 4 Argon, Gemini 3.8 Flash, Claude Opus 5.5 and Sonnet 5.5, GPT-OSS 120B (effort variants collapse into one worker per model, with the efforts it takes). Consultations, edit-only agent tasks, 2D art, plan usage in the AI Usage panel (5-hour and weekly, per model group; a Gemini worker is only passed over for the Gemini group's pressure), roles (Argon as a strongest model, Flash as quick), the Codex-style own-versus-shared sign-in choice with reuse of orphaned sign-ins, the duplicate-service warning and the shared-sign-in notice.
+- **Per-provider sign-in that is real.** Each Google AI provider gets a private `HOME`; agy keeps its token as a file there when it has no D-Bus session, so two providers can't share an account by accident. (`AGY_ACCOUNT` is ignored by agy when wrong — it can't pin an account — so it isn't used.)
+
+- **`agy` and its installer's needs are detected, and installing is offered wherever it's missing.** Adding Google AI, *Test connection*, a Google AI provider whose `agy` has gone missing (once per window session) and the orchestration panel all check for `agy` (login-shell PATH, then `~/.local/bin`); the installer's own needs — 64-bit CPU, bash, curl or wget, tar, sha512sum — are checked first and named when absent. The install command is shown in a terminal for you to run, never run for you, and a *Check again* button re-detects it without a reload (a miss is no longer cached).
+
+### Fixed
+
+- **README: the Marketplace badges showed "retired".** shields.io no longer serves Visual Studio Marketplace badges, so the page (and the Marketplace listing, which renders the README) showed retired placeholders. They're replaced by a plain install link, and every CPPO Marketplace link now uses `…?itemName=BeboutItSolutions.cppo&ssr=false#overview`.
+
+### Decisions worth knowing
+
+- **Agent tasks on Google AI are edit-only, on purpose.** agy lets a model retry a refused shell command outside its sandbox (`BypassSandbox`); with commands allowed, a test run did exactly that and wrote a file outside the workspace, and no setting (`enableTerminalSandbox`, `allowNonWorkspaceAccess`, a narrower allow rule) closed it. Commands, `read_url` and `execute_url` are therefore denied in every Google run; writes outside the worktree are refused. Google workers are skipped for `test-and-fix` and tell the lead which checks to run.
+- **No silent half-done work.** A refused action leaves agy at exit 0 with `SUCCESS`; CPPO reads `denied_actions`, lists them in the report, and fails a run that changed nothing. A signed-out `agy -p` hangs in a browser sign-in instead of failing, so every run is preceded by a free `agy models` check.
+- **2D art** comes back as 1024×1024 JPEGs (painted-on checkerboard, no real transparency) from outside the worktree; CPPO copies them into `assets/generated/`. Codex ranks ahead for art.
+
 ## 1.19.0 — 2026-11-02
 
 ### Added

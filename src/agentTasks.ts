@@ -9,6 +9,7 @@ import { log } from './log';
 import { MCP_CALL_TIMEOUT_MS } from './delegate';
 import { claudeShellArgs } from './cli';
 import { fence, details, clip } from './transcripts';
+import { AgyContext, AgyModel, AgyEvent, AgyDenied, agyAgentArgs, agyPermissions, agyPromptArgs, agyRunEnv, agySlug, collectAgyImages, deniedOf, describeDenied, parseAgyLine, removeAgyMcpConfig, writeAgyMcpConfig } from './agy';
 import { AGENT_DISABLED, CodexContext, CodexEvent, codexShellArgs } from './codex';
 import { clampEffort, Effort } from './roles';
 
@@ -30,10 +31,12 @@ import { clampEffort, Effort } from './roles';
  */
 
 export interface AgentRunSpec {
-  /** Who runs the task: Claude Code (default) on the provider's model, or Codex itself (codex.ts). */
-  runner?: 'claude' | 'codex';
+  /** Who runs the task: Claude Code (default), Codex itself, or Google AI (edit-only). */
+  runner?: 'claude' | 'codex' | 'google';
   /** Codex only: how to run it. */
   codex?: CodexContext;
+  /** Google AI only: its CLI context and real model families. */
+  google?: { ctx: AgyContext; models: AgyModel[] };
   /** The model id the runner should use, as the provider names it (e.g. "glm-5.3[1m]", "gpt-6.1-sol"). */
   runModel: string;
   /** settings.json for the run — no secrets. */
@@ -88,9 +91,15 @@ interface Task {
   lastText?: string;
   lastOutput?: number;
   cancelling?: boolean;
-  /** Who ran it — Claude Code, or Codex itself — and on which model. */
-  runner?: 'claude' | 'codex';
+  /** Who ran it — Claude Code, Codex or Google AI — and on which model. */
+  runner?: 'claude' | 'codex' | 'google';
   model?: string;
+  /** Google stream state and the temporary consulting config owned by this run. */
+  google?: { ctx: AgyContext; mcp: boolean };
+  conversationId?: string;
+  denied?: AgyDenied[];
+  googleResult?: boolean;
+  googleText?: Map<number, string>;
   /** Started for a role (roles.ts), at this effort. */
   role?: string;
   effort?: Effort;
@@ -289,6 +298,33 @@ function codexTranscript(ev: CodexEvent): string[] {
   }
 }
 
+/** Google's stream-json log as tool calls, completed agent messages and the result. */
+function googleTranscript(ev: AgyEvent, text: Map<number, string>): string[] {
+  if (ev.event === 'init') return [`_Google AI run started · ${ev.init?.model ?? '?'} · edit-only._`];
+  const step = ev.step_update;
+  if (ev.event === 'step_update' && step) {
+    const index = step.step_index ?? 0;
+    const message = (text.get(index) ?? '') + (step.text_delta ?? '');
+    text.set(index, message);
+    if (step.step_type === 'agent_response') return step.state === 'DONE' && message.trim() ? [message.trim()] : [];
+    if (step.state === 'DONE' && step.step_type === 'tool') {
+      return [
+        `**${step.tool_name ?? step.tool_info?.name ?? 'tool'}**`,
+        fence(clip(JSON.stringify(step.tool_info?.parameters ?? {}, null, 2), 2000), 'json'),
+        step.tool_info?.output ? details('Result', fence(clip(step.tool_info.output, 3000))) : '',
+      ];
+    }
+  }
+  if (ev.event === 'result') {
+    const result = ev.result ?? ev;
+    const u = result.usage;
+    const denied = deniedOf(ev);
+    return [result.response ?? '', `_Run ended: ${result.status ?? '?'} · ${u?.input_tokens ?? 0} in / ${(u?.output_tokens ?? 0) + (u?.thinking_tokens ?? 0)} out tokens._`,
+      ...(denied.length ? [`**Refused actions:** ${denied.map(describeDenied).join(', ')}`] : [])];
+  }
+  return [];
+}
+
 /** A tool call's one-line heading in a transcript: what it acts on. */
 function toolHead(input: Record<string, unknown>): string {
   const target = input.file_path ?? input.notebook_path ?? input.path ?? input.pattern ?? input.url ?? input.description;
@@ -384,7 +420,7 @@ export class AgentTasks implements vscode.Disposable {
         case 'queued':
           return `$(clock) **${name}** · queued${t.after ? ` after ${t.after}` : ''} — ${what}`;
         case 'running':
-          return `$(sync~spin) **${name}** · ${t.turns} turns · ${time}${t.lastAction ? ` · \`${t.lastAction.slice(0, 60).replace(/`/g, "'")}\`` : ''} — ${what}`;
+          return `$(sync~spin) **${name}** · ${t.turns} ${t.runner === 'codex' || t.runner === 'google' ? 'steps' : 'turns'} · ${time}${t.lastAction ? ` · \`${t.lastAction.slice(0, 60).replace(/`/g, "'")}\`` : ''} — ${what}`;
         case 'done':
           return `$(check) **${name}** · done in ${time} · ${t.files?.length ?? 0} file${t.files?.length === 1 ? '' : 's'} changed${t.applied ? ' · **applied**' : t.files?.length ? ' · not applied' : ''} — ${what}`;
         default:
@@ -414,9 +450,9 @@ export class AgentTasks implements vscode.Disposable {
       [
         `**Status:** ${t.status}${t.applied ? ' (applied)' : ''}`,
         `**Started:** ${new Date(t.started).toLocaleString()} · ${secs < 120 ? `${secs} s` : `${Math.round(secs / 60)} min`}`,
-        t.model ? `**Run by:** ${t.runner === 'codex' ? 'Codex' : 'Claude Code'} on ${t.model}${t.effort ? `, effort ${t.effort}` : ''}${t.role ? ` · role ${t.role}` : ''}` : '',
-        `**Limits:** ${t.minutes} min, ${t.maxTurns} ${t.runner === 'codex' ? 'steps' : 'turns'}`,
-        `**Turns:** ${t.turns} · **tool uses:** ${t.toolUses}${t.inTok !== undefined ? ` · **tokens:** ${t.inTok.toLocaleString('en-US')} in / ${(t.outTok ?? 0).toLocaleString('en-US')} out` : ''}`,
+        t.model ? `**Run by:** ${t.runner === 'google' ? 'Google AI (Antigravity, edit-only)' : t.runner === 'codex' ? 'Codex' : 'Claude Code'} on ${t.model}${t.effort ? `, effort ${t.effort}` : ''}${t.role ? ` · role ${t.role}` : ''}` : '',
+        `**Limits:** ${t.minutes} min, ${t.maxTurns} ${t.runner === 'codex' || t.runner === 'google' ? 'steps' : 'turns'}`,
+        `**${t.runner === 'codex' || t.runner === 'google' ? 'Steps' : 'Turns'}:** ${t.turns} · **tool uses:** ${t.toolUses}${t.inTok !== undefined ? ` · **tokens:** ${t.inTok.toLocaleString('en-US')} in / ${(t.outTok ?? 0).toLocaleString('en-US')} out` : ''}`,
         t.after ? `**Built on:** ${t.after}` : '',
         t.error ? `**Error:** ${t.error}` : '',
       ].filter(Boolean).join('  \n'),
@@ -434,6 +470,7 @@ export class AgentTasks implements vscode.Disposable {
     }
     type Block = { type?: string; text?: string; thinking?: string; name?: string; input?: Record<string, unknown>; content?: unknown; is_error?: boolean };
     const other: string[] = [];
+    const googleText = new Map<number, string>();
     for (const line of log.split('\n')) {
       if (!line.trim()) continue;
       let ev: { type?: string; subtype?: string; model?: string; permissionMode?: string; claude_code_version?: string; message?: { content?: Block[] | string }; result?: string; num_turns?: number };
@@ -441,6 +478,10 @@ export class AgentTasks implements vscode.Disposable {
         ev = JSON.parse(line);
       } catch {
         other.push(line);
+        continue;
+      }
+      if (t.runner === 'google') {
+        out.push(...googleTranscript(ev as unknown as AgyEvent, googleText));
         continue;
       }
       if (t.runner === 'codex') {
@@ -736,6 +777,7 @@ export class AgentTasks implements vscode.Disposable {
       try {
         await this.launch(t);
       } catch (err) {
+        if (t.google?.mcp) removeAgyMcpConfig(t.worktree);
         t.status = 'failed';
         t.error = (err as Error).message;
         t.ended = Date.now();
@@ -766,10 +808,15 @@ export class AgentTasks implements vscode.Disposable {
       }
     }
     if (t.links.length) log(`agent task ${t.id}: linked ${t.links.join(', ')} from the repo`);
-    t.runner = spec.runner === 'codex' && spec.codex ? 'codex' : 'claude';
+    t.runner = spec.runner === 'google' && spec.google ? 'google' : spec.runner === 'codex' && spec.codex ? 'codex' : 'claude';
     t.model = spec.runModel;
     // Workers can consult: the workers server with the restricted token (delegate, list_workers, provider_usage).
-    const access = this.access?.();
+    let access = this.access?.();
+    if (t.runner === 'google') {
+      const mcp = access ? writeAgyMcpConfig(t.worktree, access.url, access.token).created : false;
+      t.google = { ctx: spec.google!.ctx, mcp };
+      if (!mcp) access = undefined;
+    }
     if (t.runner === 'claude') {
       fs.writeFileSync(path.join(config, 'settings.json'), JSON.stringify(spec.settings, null, 2), { mode: 0o600 });
       fs.writeFileSync(
@@ -794,18 +841,21 @@ export class AgentTasks implements vscode.Disposable {
     const local = (s: string) => s.replace(repoPath, t.worktree);
     const prompt =
       `${RUN_INSTRUCTIONS}${access ? CONSULT_INSTRUCTIONS : ''}` +
+      (t.runner === 'google' ? ' You cannot run shell commands in this run (they are refused). Edit files only; do not try to build or test — say in your report which checks the lead should run.' : '') +
       ' Git LFS files in this copy are pointer files, not their content.' +
       (t.snapshotNote ? ` ${t.snapshotNote}` : '') +
-      ` You have ${t.minutes} minutes and ${t.maxTurns} ${t.runner === 'codex' ? 'steps' : 'turns'}. Your changes so far are kept if you run out, ` +
+      ` You have ${t.minutes} minutes and ${t.maxTurns} ${t.runner === 'codex' || t.runner === 'google' ? 'steps' : 'turns'}. Your changes so far are kept if you run out, ` +
       'but your report is not: if you might, stop in time and report what is done and what is left.' +
       continuation(t.after ? this.tasks.get(t.after) : undefined) +
-      (t.role === '2d-art'
+      (t.role === '2d-art' && t.runner === 'google'
+        ? " Generate each image with your image generation tool. The image tool saves its files in its own folder, outside this worktree, and you can't copy them — they are collected for you afterwards: give each image a descriptive name and list the names (and what each shows) in your report."
+        : t.role === '2d-art'
         ? ' Generate the images with your image generation tool, then save each one as a file in this worktree — at ' +
           'the path the task gives, else under assets/generated/ — and list the paths in your report.'
         : '') +
       `\n\n<task>\n${local(t.task)}\n</task>` +
       (t.context ? `\n\n<context>\n${local(t.context)}\n</context>` : '');
-    const child = t.runner === 'codex' ? this.spawnCodex(t, spec.codex!, spec.runModel, prompt, access) : this.spawnClaude(t, spec, prompt, access, config);
+    const child = t.runner === 'google' ? await this.spawnGoogle(t, spec.google!, spec.runModel, prompt) : t.runner === 'codex' ? this.spawnCodex(t, spec.codex!, spec.runModel, prompt, access) : this.spawnClaude(t, spec, prompt, access, config);
     t.child = child;
     const out = fs.openSync(path.join(t.dir, 'log.jsonl'), 'a', 0o600);
     let buf = '';
@@ -816,7 +866,8 @@ export class AgentTasks implements vscode.Disposable {
       buf += d.toString();
       let nl: number;
       while ((nl = buf.indexOf('\n')) >= 0) {
-        if (t.runner === 'codex') this.onCodexEvent(t, buf.slice(0, nl));
+        if (t.runner === 'google') this.onGoogleEvent(t, buf.slice(0, nl));
+        else if (t.runner === 'codex') this.onCodexEvent(t, buf.slice(0, nl));
         else this.onEvent(t, buf.slice(0, nl));
         buf = buf.slice(nl + 1);
       }
@@ -831,13 +882,15 @@ export class AgentTasks implements vscode.Disposable {
       t.error = `stopped: no output for ${IDLE_MS / 60_000} minutes`;
       this.kill(t);
     }, 60_000);
+    child.on('error', (err) => { t.error = err.message; });
     child.on('close', (code) => {
+      if (t.runner === 'google' && buf.trim()) this.onGoogleEvent(t, buf);
       clearTimeout(wall);
       clearInterval(idle);
       fs.closeSync(out);
       void this.finish(t, code);
     });
-    log(`agent task ${t.id}: started on ${t.worker} (${t.runner === 'codex' ? 'Codex' : 'Claude Code'}, ${spec.runModel}) in ${t.worktree}`);
+    log(`agent task ${t.id}: started on ${t.worker} (${t.runner === 'google' ? 'Google AI (Antigravity, edit-only)' : t.runner === 'codex' ? 'Codex' : 'Claude Code'}, ${spec.runModel}) in ${t.worktree}`);
     this.render();
   }
 
@@ -888,6 +941,74 @@ export class AgentTasks implements vscode.Disposable {
     const child = spawn(process.env.SHELL || '/bin/bash', codexShellArgs(ctx.bin, args), { cwd: t.worktree, env, stdio: ['pipe', 'pipe', 'pipe'] });
     child.stdin!.end(prompt);
     return child;
+  }
+
+  /** agy edits workspace files only; shell and URL actions are always refused. */
+  private async spawnGoogle(t: Task, google: NonNullable<AgentRunSpec['google']>, modelId: string, prompt: string): Promise<ChildProcess> {
+    const model = google.models.find((m) => m.id === modelId);
+    if (!model) throw new Error(`Google AI model ${modelId} isn't available`);
+    const env = await agyRunEnv(google.ctx, {});
+    const files = agyPromptArgs(prompt);
+    try {
+      const child = spawn(google.ctx.bin, agyAgentArgs({
+        slug: agySlug(model, t.effort), settings: agyPermissions(t.google?.mcp ? { mcpServer: CONSULT_SERVER } : undefined),
+        promptArgs: files.args, timeoutSec: t.minutes * 60,
+      }), { cwd: t.worktree, env, detached: true, stdio: ['ignore', 'pipe', 'pipe'] });
+      child.on('close', () => files.cleanup());
+      return child;
+    } catch (err) {
+      files.cleanup();
+      throw err;
+    }
+  }
+
+  private onGoogleEvent(t: Task, line: string): void {
+    const ev = parseAgyLine(line);
+    if (!ev) return;
+    const step = ev.step_update;
+    t.conversationId = ev.conversation_id ?? ev.result?.conversation_id ?? step?.conversation_id ?? t.conversationId;
+    if (ev.event === 'init') {
+      t.model = ev.init?.model ?? t.model;
+      t.conversationId = (ev.init as { conversation_id?: string } | undefined)?.conversation_id ?? t.conversationId;
+    }
+    if (ev.event === 'step_update' && step) {
+      if (step.step_type === 'agent_response') {
+        t.googleText ??= new Map();
+        const index = step.step_index ?? 0;
+        const text = (t.googleText.get(index) ?? '') + (step.text_delta ?? '');
+        t.googleText.set(index, text);
+        if (step.state === 'DONE') t.lastText = text;
+      }
+      if (step.state === 'DONE' && step.step_type === 'tool') {
+        t.toolUses++;
+        t.turns++;
+        const name = step.tool_name ?? step.tool_info?.name ?? 'tool';
+        const params = step.tool_info?.parameters ?? {};
+        const arg = Object.values(params).find((v) => typeof v === 'string');
+        t.lastAction = `${name} ${typeof arg === 'string' ? arg.slice(0, 80) : ''}`.trim();
+        if (/write|edit|replace|create/i.test(name)) {
+          for (const [key, value] of Object.entries(params)) {
+            if (typeof value !== 'string' || !/path|file/i.test(key)) continue;
+            const rel = path.relative(t.worktree, path.resolve(t.worktree, value));
+            if (rel && rel !== '..' && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel)) t.written.add(rel.split(path.sep).join('/'));
+          }
+        }
+        if (t.turns > t.maxTurns && !t.error) {
+          t.error = `stopped at its ${t.maxTurns}-step limit`;
+          this.kill(t);
+        }
+      }
+      this.render();
+    }
+    if (ev.event === 'result') {
+      const result = ev.result ?? ev;
+      t.googleResult = true;
+      t.report = result.response;
+      t.inTok = result.usage?.input_tokens;
+      t.outTok = result.usage ? (result.usage.output_tokens ?? 0) + (result.usage.thinking_tokens ?? 0) : undefined;
+      t.denied = deniedOf(ev);
+      if (result.status !== 'SUCCESS' && !t.error) t.error = `Google AI run failed: ${result.status ?? 'unknown status'}`;
+    }
   }
 
   /** Codex's `exec --json` events: items (messages, commands, file changes, MCP calls) and turn usage. */
@@ -989,6 +1110,23 @@ export class AgentTasks implements vscode.Disposable {
       }
     }
     try {
+      if (t.runner === 'google') {
+        if (t.google?.mcp) removeAgyMcpConfig(t.worktree);
+        if (code === 0 && !t.googleResult && !t.error) t.error = 'Google AI ended without a result';
+        if (t.role === '2d-art' && t.google && t.conversationId) {
+          const copied: string[] = [];
+          for (const file of collectAgyImages(t.google.ctx.home, t.conversationId, t.started - 5000)) {
+            const rel = `assets/generated/${path.basename(file)}`;
+            const dest = path.join(t.worktree, rel);
+            fs.mkdirSync(path.dirname(dest), { recursive: true });
+            try { fs.copyFileSync(file, dest, fs.constants.COPYFILE_EXCL); }
+            catch (err) { if ((err as NodeJS.ErrnoException).code === 'EEXIST') continue; throw err; }
+            copied.push(rel);
+            t.written.add(rel);
+          }
+          if (copied.length) t.report = `${t.report ?? ''}\n\nCollected images: ${copied.join(', ')}.\nGoogle AI's image tool returns 1024×1024 JPEGs and can't make real transparency (any checkerboard is painted into the picture) — resize/cut out as needed.`;
+        }
+      }
       await git(t.worktree, ['add', '-A']);
       // Changes to files that existed land; new files only if the worker wrote
       // them with its file tools — a cache or build output from its own checks
@@ -1003,7 +1141,8 @@ export class AgentTasks implements vscode.Disposable {
         // Codex creates most files with shell heredocs and redirects, which never show up as edits — a
         // new source file it made that way is the work (a task lost its whole new module this way). Its
         // build output and caches are gitignored or match CACHE_LIKE; everything else new is kept.
-        const shellMade = t.runner === 'codex' && !CACHE_LIKE.test(file);
+        // Google's edit-only runner also keeps new files: its tools may use unrecognized path parameters.
+        const shellMade = (t.runner === 'codex' || t.runner === 'google') && !CACHE_LIKE.test(file);
         if (code === 'A' && !t.written.has(file) && !art && !shellMade) t.sideEffects.push(file);
         else included.push(file);
       }
@@ -1028,6 +1167,10 @@ export class AgentTasks implements vscode.Disposable {
     } catch (err) {
       t.error = t.error ?? `collecting changes failed: ${(err as Error).message}`;
     }
+    if (t.denied?.length) {
+      if (t.files?.length === 0 && !t.report?.trim() && !t.error) t.error = "Google AI tried an action it isn't allowed to and changed nothing";
+      t.report = `${t.report ?? ''}\n\n**Incomplete work notice:** Google AI was refused ${t.denied.length} action(s) it tried (${t.denied.map(describeDenied).join(', ')}): the work may be incomplete.`;
+    }
     try {
       await git(t.repo, ['worktree', 'remove', '--force', t.worktree]);
     } catch (err) {
@@ -1038,7 +1181,7 @@ export class AgentTasks implements vscode.Disposable {
     if (t.status === 'running') t.status = t.cancelling ? 'cancelled' : t.error || (code !== 0 && !t.report) ? 'failed' : 'done';
     t.ended = Date.now();
     t.child = undefined;
-    log(`agent task ${t.id}: ${t.status} in ${Math.round((t.ended - t.started) / 1000)} s, ${t.turns} turns, ${t.files?.length ?? 0} files changed`);
+    log(`agent task ${t.id}: ${t.status} in ${Math.round((t.ended - t.started) / 1000)} s, ${t.turns} ${t.runner === 'codex' || t.runner === 'google' ? 'steps' : 'turns'}, ${t.files?.length ?? 0} files changed`);
     this.onTaskDone?.(t.worker, t.inTok ?? 0, t.outTok ?? 0);
     this.render();
     for (const w of t.waiters.splice(0)) w();
@@ -1048,8 +1191,15 @@ export class AgentTasks implements vscode.Disposable {
   private kill(t: Task): void {
     const c = t.child;
     if (!c?.pid) return;
-    c.kill('SIGTERM');
-    setTimeout(() => c.exitCode === null && c.kill('SIGKILL'), 5000);
+    if (t.runner === 'google') {
+      const pid = c.pid;
+      const signal = (sig: NodeJS.Signals) => { try { process.kill(-pid, sig); } catch { /* already gone */ } };
+      signal('SIGTERM');
+      setTimeout(() => signal('SIGKILL'), 5000);
+    } else {
+      c.kill('SIGTERM');
+      setTimeout(() => c.exitCode === null && c.kill('SIGKILL'), 5000);
+    }
   }
 
   cancel(id: string): string {
@@ -1089,7 +1239,7 @@ export class AgentTasks implements vscode.Disposable {
       return { text: `Task ${id} is queued${t.after ? ` — it starts when ${t.after} is done` : ' — waiting for a free slot'} — call wait_task again now.` };
     }
     if (t.status === 'running') {
-      return { text: `Task ${id} is still running (${secs} s, ${t.turns} turns, ${t.toolUses} tool calls; last: ${t.lastAction ?? '—'}). Still running — call wait_task again now; don't report to the user yet.` };
+      return { text: `Task ${id} is still running (${secs} s, ${t.turns} ${t.runner === 'codex' || t.runner === 'google' ? 'steps' : 'turns'}, ${t.toolUses} tool calls; last: ${t.lastAction ?? '—'}). Still running — call wait_task again now; don't report to the user yet.` };
     }
     let diff = '';
     if (t.patchFile) {
@@ -1099,7 +1249,7 @@ export class AgentTasks implements vscode.Disposable {
     const stopped = t.status !== 'done' && Boolean(t.result);
     return {
       text: [
-        `Task ${id}: ${t.status}${t.error ? ` (${t.error})` : ''} — ${t.worker}, ${secs} s, ${t.turns} turns${t.costUsd !== undefined ? `, ~$${t.costUsd.toFixed(3)} by Claude Code's estimate` : ''}.` +
+        `Task ${id}: ${t.status}${t.error ? ` (${t.error})` : ''} — ${t.worker}, ${secs} s, ${t.turns} ${t.runner === 'codex' || t.runner === 'google' ? 'steps' : 'turns'}${t.costUsd !== undefined ? `, ~$${t.costUsd.toFixed(3)} by Claude Code's estimate` : ''}.` +
           (t.after ? ` Built on ${t.after}.` : '') +
           (t.snapshotNote ? `\n${t.snapshotNote}` : ''),
         `\nWorker's report:\n${t.report ?? '(none)'}`,
@@ -1186,7 +1336,7 @@ export class AgentTasks implements vscode.Disposable {
     const pick = await vscode.window.showQuickPick(
       all.map((t) => ({
         label: `${t.status === 'running' ? '$(sync~spin)' : t.status === 'queued' ? '$(clock)' : t.status === 'done' ? '$(check)' : '$(error)'} ${t.id} · ${t.worker}`,
-        description: `${t.status}${t.applied ? ', applied' : ''} · ${t.turns} turns · ${t.files?.length ?? 0} files`,
+        description: `${t.status}${t.applied ? ', applied' : ''} · ${t.turns} ${t.runner === 'codex' || t.runner === 'google' ? 'steps' : 'turns'} · ${t.files?.length ?? 0} files`,
         detail: t.task.slice(0, 140),
         t,
       })),
@@ -1215,7 +1365,10 @@ export class AgentTasks implements vscode.Disposable {
     // of the user's repo now — nothing will be left to collect it later.
     for (const t of this.tasks.values()) {
       if (t.status !== 'running') continue;
-      t.child?.kill('SIGKILL');
+      if (t.runner === 'google' && t.child?.pid) {
+        try { process.kill(-t.child.pid, 'SIGKILL'); } catch { /* already gone */ }
+      } else t.child?.kill('SIGKILL');
+      if (t.google?.mcp) removeAgyMcpConfig(t.worktree);
       for (const name of t.links ?? []) {
         try {
           fs.unlinkSync(path.join(t.worktree, name)); // the user's own folders: unlink, never recurse

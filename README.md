@@ -1,17 +1,16 @@
 # CPPO — Claude Parallel Profile Orchestration
 
-[![Marketplace](https://img.shields.io/visual-studio-marketplace/v/BeboutItSolutions.cppo?label=Marketplace)](https://marketplace.visualstudio.com/items?itemName=BeboutItSolutions.cppo)
-[![Installs](https://img.shields.io/visual-studio-marketplace/i/BeboutItSolutions.cppo)](https://marketplace.visualstudio.com/items?itemName=BeboutItSolutions.cppo)
+[**Install CPPO from the VS Code Marketplace**](https://marketplace.visualstudio.com/items?itemName=BeboutItSolutions.cppo&ssr=false#overview)
 [![Release](https://img.shields.io/github/v/release/warrenb213/cppo?label=release)](https://github.com/warrenb213/cppo/releases/latest)
 [![Platform: Linux](https://img.shields.io/badge/platform-Linux%20%7C%20WSL%20%7C%20SSH-orange.svg)](#requirements)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Donate](https://img.shields.io/badge/donate-PayPal-00457C.svg?logo=paypal)](https://paypal.me/beboutit503) [![Scan to donate through PayPal: paypal.me/beboutit503](docs/support/paypal-qr.png)](https://paypal.me/beboutit503)
 
-**Make Claude Code the lead of a multi-model team.** The Claude in your chat hands focused questions and real, sandboxed coding work to the other models you use — GLM on Z.ai, GPT through OpenAI Codex, Claude on your own plan — routes each kind of work by rules you set once, and reviews every change before it reaches your code. Underneath: a different Claude account in each VS Code window, with one shared conversation history.
+**Make Claude Code the lead of a multi-model team.** The Claude in your chat hands focused questions and real, sandboxed coding work to the other models you use — GLM on Z.ai, GPT through OpenAI Codex, Gemini through Google AI, Claude on your own plan — routes each kind of work by rules you set once, and reviews every change before it reaches your code. Underneath: a different Claude account in each VS Code window, with one shared conversation history.
 
 It's a **companion** for the [Claude Code extension for VS Code](https://marketplace.visualstudio.com/items?itemName=anthropic.claude-code), not a replacement: Claude Code must be installed, and stays the tool you work in.
 
-> **About CPPO.** CPPO began as a fork of [Claude Parallel Accounts](https://github.com/DercasDrol/claude-parallel-profiles) by DercasDrol (MIT), which provides the per-window accounts and shared history; providers, workers, agent tasks and orchestration are CPPO's own, and it is now a separate project. Install it from the [VS Code Marketplace](https://marketplace.visualstudio.com/items?itemName=BeboutItSolutions.cppo) (or from a `.vsix` on [GitHub Releases](https://github.com/warrenb213/cppo/releases)) — see [Install](#install). Coming from Claude Parallel Accounts, or an earlier CPPO? See [Moving from an earlier copy](#moving-from-an-earlier-copy).
+> **About CPPO.** CPPO began as a fork of [Claude Parallel Accounts](https://github.com/DercasDrol/claude-parallel-profiles) by DercasDrol (MIT), which provides the per-window accounts and shared history; providers, workers, agent tasks and orchestration are CPPO's own, and it is now a separate project. Install it from the [VS Code Marketplace](https://marketplace.visualstudio.com/items?itemName=BeboutItSolutions.cppo&ssr=false#overview) (or from a `.vsix` on [GitHub Releases](https://github.com/warrenb213/cppo/releases)) — see [Install](#install). Coming from Claude Parallel Accounts, or an earlier CPPO? See [Moving from an earlier copy](#moving-from-an-earlier-copy).
 
 > **A personal project — keep personal and work separate.** CPPO is built and shared in a personal capacity; it isn't affiliated with or endorsed by any employer. It's useful for personal projects and, where your organization allows it, for work — but **don't mix the two on one machine**: keep personal accounts, API keys and subscriptions off work equipment, and work accounts, code and credentials off personal equipment. On a work machine, check your organization's policies on AI tools and on sending code to outside providers first. See [Terms of service](#terms-of-service).
 
@@ -36,11 +35,11 @@ It's a **companion** for the [Claude Code extension for VS Code](https://marketp
 - **Real work, isolated.** An agent task runs headless in a scratch **git worktree** of your repo (HEAD plus your uncommitted changes), with a fresh config — none of your login, plugins or MCP servers — and your dependency folders linked in so it can build and run the tests. [Agent tasks →](#agent-tasks-real-work-reviewed-by-the-lead)
 - **Nothing lands unreviewed.** Every task comes back as a report and a diff; only the lead applies it, to the working tree, unstaged — and a chain of tasks applies all of it or none of it.
 - **Predictable routing, not model roulette.** You set once which models serve which kind of work — *review*, *implement*, *hard-reasoning*, *2d-art*… — in what order and at what effort. The lead asks by role; the extension picks the same way every time and says who served and what it passed over. [Orchestration →](#orchestration-roles-and-fallbacks)
-- **Aware of every plan, without spending to check.** Each plan's 5-hour and weekly windows come from Claude Code's and Codex's own reports (and Z.ai's monitor); when one service is near its threshold, work goes to the next service in the role's chain.
+- **Aware of every plan, without spending to check.** Each plan's 5-hour and weekly windows come from Claude Code's, Codex's and Antigravity's own reports (and Z.ai's monitor); when one service is near its threshold, work goes to the next service in the role's chain.
 - **Long work that survives.** Tasks get hours, not minutes; a run stopped at a limit keeps its changes, and a follow-up continues where it left off. Pipelines — fix → test → docs — queue in one go.
 - **Models that consult each other.** GLM can ask Claude for a second opinion in the middle of a task — answers only, through a token that can't start tasks of its own.
 - **Everything visible.** Live transcripts of every run and consultation, one click from the status bar: each command, each edit, the report, the diff, and which model did it.
-- **Your credentials stay yours.** Provider keys live in VS Code's secret storage; a subscription is only ever used by its own client (Claude Code, Codex); the servers involved listen on `127.0.0.1` only; no telemetry. [Privacy →](#privacy--your-data)
+- **Your credentials stay yours.** Provider keys live in VS Code's secret storage; a subscription is only ever used by its own client (Claude Code, Codex, Antigravity); the servers involved listen on `127.0.0.1` only; no telemetry. [Privacy →](#privacy--your-data)
 
 **The foundation: an account per window.**
 
@@ -62,6 +61,7 @@ It's a **companion** for the [Claude Code extension for VS Code](https://marketp
 | **Custom gateway** | ✓ | ✓ | ✓ | — | — |
 | **OpenAI Codex — ChatGPT plan** | — only Codex may use the plan | ✓ Codex, read-only, tools off | ✓ Codex itself, in its sandbox | ✓ Codex image generation | ✓ the plan's Codex windows (Codex's own report) |
 | **OpenAI Codex — API key** | ✓ GPT through the local proxy, per token | ✓ | ✓ | ✓ if the account has it | tokens only |
+| **Google AI plan** (Antigravity) | — only Antigravity may use the plan | ✓ Gemini 4 Argon / 3.8 Flash and the Claude and GPT-OSS models your plan includes, no tools | ✓ edit-only (no shell) | ✓ images, as 1024×1024 JPEGs | ✓ the plan's 5-hour and weekly windows, per model group (Antigravity's own report) |
 
 **Effort** is set per role entry, low → max, and reaches each runner its own way: Claude Code's `--effort`, Codex's reasoning effort (within what the model takes), a thinking budget on Messages-API workers (Z.ai, gateways). **Images as input** (reviewing art, screenshots): every Claude model, and the Codex models that say so.
 
@@ -97,6 +97,7 @@ Every VS Code window runs its own extension host, so its environment is its own.
 | Workers | `delegate.ts`, `usage.ts` | The MCP server the lead uses: `delegate`, usage, agent task tools. |
 | Orchestration | `roles.ts`, `orchestration.ts` | Roles, their fallback chains and effort; the panel that edits them. |
 | OpenAI Codex | `codex.ts` | The Codex CLI as a worker: consultations, agent task runs, account, plan usage, models. |
+| Google AI | `agy.ts` | Antigravity's CLI (`agy`) as a worker: consultations, edit-only agent task runs, sign-in homes, plan usage, models. |
 | Agent tasks | `agentTasks.ts`, `transcripts.ts` | Snapshots, worktrees, headless runs, diffs, transcripts. |
 | Host state | `hostState.ts` | `~/.claude-windows/.state.json`, shared by every window on the host. |
 | Uninstall | `uninstall.js` | Hands back the account and history and removes the extension's folders. |
@@ -114,12 +115,13 @@ Every VS Code window runs its own extension host, so its environment is its own.
 | `git` | agent tasks only: they work on a worktree of the window's repository |
 | `uv`, or Python 3.10–3.14 | non-Claude models only: installs the local LiteLLM proxy |
 | Codex CLI | OpenAI Codex only: the OpenAI extension (`openai.chatgpt`), or `codex` on `$PATH` (`npm install -g @openai/codex`) |
+| Antigravity CLI (`agy`) | Google AI only: `agy` on `$PATH` or at `~/.local/bin/agy` (`curl -fsSL https://antigravity.google/cli/install.sh \| bash`) — CPPO checks for `agy` and the installer's own needs (bash, curl or wget, tar, sha512sum, a 64-bit CPU), offers the command in a terminal and never runs it for you; it asks again whenever a Google AI provider finds `agy` missing |
 
 ---
 
 ## Install
 
-1. **Install it from the Marketplace:** open the Extensions view, search for **CPPO** (publisher *BeboutItSolutions*) and click *Install* — or run `code --install-extension BeboutItSolutions.cppo`, or use the [Marketplace page](https://marketplace.visualstudio.com/items?itemName=BeboutItSolutions.cppo). Install it **where the extension runs**: in a WSL or SSH window, install it in that window so it lands on the Linux remote. Reload the window.
+1. **Install it from the Marketplace:** open the Extensions view, search for **CPPO** (publisher *BeboutItSolutions*) and click *Install* — or run `code --install-extension BeboutItSolutions.cppo`, or use the [Marketplace page](https://marketplace.visualstudio.com/items?itemName=BeboutItSolutions.cppo&ssr=false#overview). Install it **where the extension runs**: in a WSL or SSH window, install it in that window so it lands on the Linux remote. Reload the window.
 2. **Or install a `.vsix`** — for an offline or locked-down host, or a build of your own: download `cppo-<version>.vsix` from the [latest GitHub release](https://github.com/warrenb213/cppo/releases/latest) (or build it: `npm ci && npm run package`, see [Development](#development--releases)), then *Extensions → ⋯ → Install from VSIX…* or `code --install-extension cppo-<version>.vsix`. Reload the window.
 3. **You're probably already signed in.** The status bar shows your email; the account is saved automatically.
 4. **Add another account:** in Claude Code, sign in as it (account menu, or `/login`). The extension saves it and reloads the window onto it; the previous account stays in the list.
@@ -295,7 +297,7 @@ A worker enabled for agent tasks runs **Claude Code headless on its own model** 
 The account's hover card lists the workers and the recent tasks: worker, progress and current action while running; files changed and whether applied when done; why it stopped.
 
 - **Transcripts.** A task's worker name in the hover opens that task's transcript; a worker under *Workers* (with a count) lists its tasks and consultations in this window. Transcripts open in the Markdown preview. A task's shows its run — messages, each tool call with its command or edit, results and thinking collapsed, the report and changes — and follows along while it runs; a consultation's shows the question, context and answer. Also *CPPO: Show Worker Transcripts*. Consultations are kept in memory only, the latest 50.
-- **Usage.** `provider_usage` (for the lead and for runs) and *CPPO: Show Provider Usage* report how much of each plan is used, so work can be balanced across the different services you use: the Anthropic login's 5-hour, weekly and per-model weekly windows (from the usage report Claude Code caches in this account's windows — just a file read — and its rate-limit reports on login-worker calls), the ChatGPT plan's Codex windows (from Codex itself, without sending a message), Z.ai's Coding Plan windows (from its quota monitor — unofficial, may change), and this window's calls, tasks and tokens per worker.
+- **Usage.** `provider_usage` (for the lead and for runs) and *CPPO: Show Provider Usage* report how much of each plan is used, so work can be balanced across the different services you use: the Anthropic login's 5-hour, weekly and per-model weekly windows (from the usage report Claude Code caches in this account's windows — just a file read — and its rate-limit reports on login-worker calls), the ChatGPT plan's Codex windows (from Codex itself, without sending a message), the Google AI plan's windows (from `agy`'s `/usage`, no model call), Z.ai's Coding Plan windows (from its quota monitor — unofficial, may change), and this window's calls, tasks and tokens per worker.
 
 ### OpenAI Codex as a worker
 
@@ -310,6 +312,17 @@ The account's hover card lists the workers and the recent tasks: worker, progres
 - **Test connection** asks Codex who it's signed in as (ChatGPT plan), or checks the key against OpenAI's model list (API key). *Refresh model list* re-reads what Codex offers.
 
 #### GPT in chat windows (OpenAI API key)
+
+### Google AI as a worker
+
+*Add a Provider → Google AI (Antigravity)* adds the models **your Google AI plan** includes — whatever `agy models` lists for your account, e.g. Gemini 4 Argon, Gemini 3.8 Flash, Claude Opus/Sonnet 5.5 and GPT-OSS 120B on AI Ultra — as workers. Everything runs through **Antigravity's own CLI** (`agy`); the extension never reads or sends its sign-in. A plan can't serve a chat window, and Gemini API keys are not offered here: they bill separately and the plan's quota doesn't apply to them.
+
+- **Signing in.** Each provider gets **a sign-in of its own** by default: a private `HOME` (`~/.claude-windows/agy/<id>/home`) in which `agy` keeps its token as a file, with no D-Bus session — so a work provider and a personal one can't quietly ride on the same Google account. Adding it opens a terminal running `agy` for you to sign in (its browser may be a fresh profile); CPPO then checks with `agy models` — a signed-out `agy -p` doesn't fail, it opens a browser sign-in and hangs, so CPPO never sends a prompt without that check. Using the host's own sign-in (one per Linux user, possibly in the OS keyring) is an explicit choice, with the same one-time notice as Codex's when two Claude accounts share it. `AGY_ACCOUNT` isn't used: agy ignores a wrong value, so it can't pin an account.
+- **Consultations** run `agy -p` in an empty temporary folder with shell and URL actions denied.
+- **Agent tasks are edit-only.** `agy` lets a model retry a refused command *outside* its sandbox (`BypassSandbox`), and no setting turns that off, so CPPO never allows commands: the worker reads and edits files in the worktree (writes elsewhere are refused) and tells the lead which checks to run. That's why Google workers are skipped for `test-and-fix`. It can consult other workers through the workers MCP server (a `.agents/mcp_config.json` CPPO writes into the worktree and removes before the diff is taken). Silent half-done work — `agy` exits 0 with `SUCCESS` when an action was refused — is reported: the refused actions are listed in the task's report, and a run that changed nothing is marked failed.
+- **2D art.** `agy`'s image tool saves its pictures outside the worktree as 1024×1024 JPEGs with any checkerboard "transparency" painted in; CPPO copies them into `assets/generated/` and says so in the report. Codex ranks ahead of Google for `2d-art`.
+- **Usage.** `provider_usage` shows the plan's 5-hour and weekly windows for each model group (Gemini; Claude and GPT) from `agy`'s built-in `/usage` report — free, no model call. A Gemini worker is passed over only when the Gemini group is near its threshold, and likewise for the other group.
+- **Test connection** checks the sign-in and lists the models; it never sends a prompt.
 
 An API-key Codex provider can also bill a whole chat window: *Edit or Remove a Provider → Codex → Chat-window models* (or *Set up chat windows* when adding it, or picking it under *Switch provider*) chooses which GPT models appear in Claude Code's model picker and which one is the default.
 
@@ -334,7 +347,7 @@ All under **CPPO** in the Command Palette; most are also in the status bar hover
 | Account Quick Action | The status bar click. |
 | Forget a Saved Account | Remove an account and delete its token everywhere on this host. |
 | Switch Provider for This Window | Anthropic, an API key, or a gateway; reloads the window. |
-| Add a Provider | Presets (Z.ai, Poe), OpenAI Codex (workers), an Anthropic API key, or a custom gateway. |
+| Add a Provider | Presets (Z.ai, Poe), OpenAI Codex or Google AI (workers), an Anthropic API key, or a custom gateway. |
 | Edit or Remove a Provider | Key, URL, models, connection test, non-Claude models, workers. |
 | Show Agent Tasks | Open a task's transcript, log or patch, or cancel it. |
 | Show Worker Transcripts | A worker's tasks and consultations in this window. |
@@ -358,7 +371,8 @@ This extension manages credentials, so it holds itself to a strict policy — ea
   - Z.ai's quota monitor, for usage reports (a plain GET with the Z.ai key);
   - with non-Claude models on, the hash-pinned LiteLLM install from PyPI, and the proxy's traffic to your gateway;
   - Claude Code runs it starts (login workers, agent tasks) talk to their provider like any Claude Code session;
-  - Codex runs it starts (Codex workers and their agent tasks, usage and model lookups through `codex app-server`) talk to OpenAI like any Codex session, and an OpenAI API key's connection test reads `api.openai.com/v1/models`.
+  - Codex runs it starts (Codex workers and their agent tasks, usage and model lookups through `codex app-server`) talk to OpenAI like any Codex session, and an OpenAI API key's connection test reads `api.openai.com/v1/models`;
+  - Google AI runs it starts (workers, agent tasks, `agy models` and `agy` `/usage`) talk to Google like any Antigravity session; CPPO sends no request of its own to Google.
 
   With no providers or workers added, it makes no requests at all.
 - **Two small files live under `~/.config/cppo`** (owner-only), outside everything an older uninstall script removes: the usage lease (`in-use`: a timestamp, the extension ID and version) and a backup of the host state (`state.backup.json`: provider records, roles, account names and the host ID — no keys, tokens or conversation content). CPPO restores the state from the backup if its main file goes missing or unreadable, and says so.
@@ -448,7 +462,7 @@ scripts/render-diagrams.sh   # README diagrams: docs/diagrams/*.mmd → .png
 
 The README's diagrams are PNGs rendered from the Mermaid sources in `docs/diagrams/` — VS Code's extension page doesn't render Mermaid, and the packager refuses SVG images. Edit the `.mmd`, then run the script.
 
-**Releases.** Each version is built with `npm run package`, published to the [Marketplace](https://marketplace.visualstudio.com/items?itemName=BeboutItSolutions.cppo), and attached to a [GitHub Release](https://github.com/warrenb213/cppo/releases) as `cppo-<version>.vsix` (a `v<version>` tag, the version's `CHANGELOG.md` entry as its notes). It's done by hand: no workflow publishes anything — GitHub Actions are disabled on the repository, and the publish steps in the workflow files inherited from the original project ([`ci.yml`](.github/workflows/ci.yml), [`release.yml`](.github/workflows/release.yml)) only run in that project's repository. The Marketplace page shows the README packaged in the extension, so README changes reach it with the next version.
+**Releases.** Each version is built with `npm run package`, published to the [Marketplace](https://marketplace.visualstudio.com/items?itemName=BeboutItSolutions.cppo&ssr=false#overview), and attached to a [GitHub Release](https://github.com/warrenb213/cppo/releases) as `cppo-<version>.vsix` (a `v<version>` tag, the version's `CHANGELOG.md` entry as its notes). It's done by hand: no workflow publishes anything — GitHub Actions are disabled on the repository, and the publish steps in the workflow files inherited from the original project ([`ci.yml`](.github/workflows/ci.yml), [`release.yml`](.github/workflows/release.yml)) only run in that project's repository. The Marketplace page shows the README packaged in the extension, so README changes reach it with the next version.
 
 **Copies and generations.** `package.json` carries `"cppo": { "generation": N }` — 4 for `BeboutItSolutions.cppo` (3 was `beboutit503.cppo`). Every copy with the mark knows the others whatever their ID (`src/copies.ts`, `uninstall.js`): the newest generation runs, older ones step aside, and an uninstaller keeps the shared data while another copy is installed. A future change of publisher or name bumps the generation. Bridge builds for an earlier ID are the same code under that ID: `scripts/package-variant.py <publisher> <name> "<display name>" <generation> <version> <out.vsix>`.
 

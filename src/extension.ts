@@ -323,6 +323,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     await workers.reconcile();
     void providers.promptMissingKeys();
     void providers.noticeSharedCodex();
+    void providers.noticeSharedGoogle();
+    void providers.noticeMissingGoogle();
   });
   providers.warnAboutSharedOverride();
 

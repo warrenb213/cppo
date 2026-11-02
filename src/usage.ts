@@ -21,6 +21,8 @@ export interface UsageWindow {
   /** ms since epoch. */
   resetsAt?: number;
   detail?: string;
+  /** Which model group the window limits (Google AI: 'gemini' or 'third-party'); a window without one limits the whole provider. */
+  scope?: string;
 }
 
 export interface UsageEntry {

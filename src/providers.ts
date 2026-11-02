@@ -2,6 +2,7 @@ import * as vscode from 'vscode';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as crypto from 'crypto';
+import { AGY_INSTALL_COMMAND, AgyContext, AgyModel, agyBinary, agyHome, agyImageSupport, agyInstallBlockers, agyModels, agySignedIn, agySignInCommand, findOrphanAgyHomes } from './agy';
 import { WindowBinding } from './binding';
 import { LOGIN_PROVIDER } from './delegate';
 import type { Worker, WorkerSource } from './delegate';
@@ -79,9 +80,15 @@ export interface Provider {
   /**
    * 'anthropic': an Anthropic API key, sent straight to Anthropic. 'codex': OpenAI
    * Codex — GPT through the Codex CLI for workers and agent tasks (codex.ts); on
-   * an API key, also chat windows through the local proxy. Unset: a gateway.
+   * an API key, also chat windows through the local proxy. 'google': Google AI
+   * through Antigravity's CLI, plan workers and edit-only agent tasks. Unset: a gateway.
    */
-  kind?: 'anthropic' | 'codex';
+  kind?: 'anthropic' | 'codex' | 'google';
+  /** Google AI plan only: a private HOME (default), or this Linux user's shared sign-in. */
+  googleHome?: 'own' | 'shared';
+  /** Google AI's model families and image capability, reported by agy itself. */
+  googleModels?: AgyModel[];
+  googleImages?: boolean;
   /** Codex only: its ChatGPT plan (Codex's own sign-in) or an OpenAI API key. */
   codexAuth?: CodexAuth;
   /**
@@ -131,12 +138,14 @@ const CATALOG_TTL_MS = 24 * 60 * 60 * 1000;
 const legacySecretKey = (id: string) => `claudeProfiles.provider.${id}`;
 const ANTHROPIC_API = 'https://api.anthropic.com';
 const isNative = (p: Provider) => p.kind === 'anthropic';
+const isGoogle = (p: Provider) => p.kind === 'google';
+const sharesUserGoogle = (p: Provider) => isGoogle(p) && p.googleHome === 'shared';
 const isCodex = (p: Provider) => p.kind === 'codex';
 /** A Codex ChatGPT-plan provider on this host's own Codex sign-in (~/.codex) — shared with every Claude account here. */
 const sharesUserCodex = (p: Provider) => isCodex(p) && p.codexAuth !== 'api-key' && p.codexHome !== 'own';
 
-/** A Codex provider that can serve a chat window: an API key (a ChatGPT plan is Codex's own — workers only). */
-const chatCapable = (p: Provider) => !isCodex(p) || p.codexAuth === 'api-key';
+/** Plan providers use their own clients for workers only; a Codex API key can also serve chat windows. */
+const chatCapable = (p: Provider) => !isGoogle(p) && (!isCodex(p) || p.codexAuth === 'api-key');
 
 const OPENAI_API = 'https://api.openai.com';
 
@@ -165,6 +174,7 @@ function codexSlots(p: Provider): Partial<Record<Family, string>> {
 /** What the provider is, in a menu's description column. */
 function describeKind(p: Provider): string {
   if (isNative(p)) return 'Anthropic API key';
+  if (isGoogle(p)) return `Google AI (Antigravity) · Google AI plan · ${sharesUserGoogle(p) ? "host's shared sign-in" : 'own sign-in'} · workers`;
   if (isCodex(p)) {
     return p.codexAuth === 'api-key'
       ? `OpenAI Codex · API key · workers${p.extraModels?.length ? ' + chat windows' : ''}`
@@ -223,7 +233,7 @@ const PRESETS: Record<GatewayPreset, PresetDef> = {
 
 /** Whether a provider's models come from its /v1/models list (custom gateways and Poe) or are fixed. */
 function readsCatalog(p: Provider): boolean {
-  if (isNative(p) || isCodex(p)) return false;
+  if (isNative(p) || isCodex(p) || isGoogle(p)) return false;
   return p.preset ? PRESETS[p.preset].readsCatalog : true;
 }
 
@@ -329,6 +339,7 @@ interface ProviderSettings {
  * can't sneak past it.
  */
 export function settingsFor(p: Provider, key: string, proxy?: ProxyHandle): ProviderSettings {
+  if (isGoogle(p)) throw new Error(`${p.name} runs on your Google AI plan, which only Antigravity itself may use — it can't serve a chat window.`);
   // Anthropic itself: just the key. The base URL is pinned so a shell export
   // can't redirect it; Claude Code's own model lineup applies unchanged.
   if (isNative(p)) {
@@ -488,6 +499,7 @@ const LOGIN_WORKER_NOTES: Record<string, string> = {
 
 /** The models a provider can offer as workers, with a one-line note for the lead. */
 export function workerChoices(p: Provider): Array<{ model: string; note: string }> {
+  if (isGoogle(p)) return (p.googleModels ?? []).map((m) => ({ model: m.id, note: `${m.name} — ${m.note.replace(/\.$/, '')} (Google AI)` }));
   if (isCodex(p)) {
     return (p.codexModels?.length ? p.codexModels : CODEX_FALLBACK_MODELS).map((m) => ({
       model: m.id,
@@ -544,6 +556,7 @@ function workerId(p: Provider, model: string): string {
 function serviceOf(p: Provider): { key: string; label: string } {
   if (isNative(p)) return { key: 'anthropic-api', label: 'Anthropic' };
   if (isCodex(p)) return { key: 'openai', label: 'OpenAI' };
+  if (isGoogle(p)) return { key: 'google', label: 'Google AI' };
   if (p.preset) return { key: p.preset, label: PRESETS[p.preset].label };
   let host = p.baseUrl;
   try {
@@ -564,7 +577,9 @@ export interface ModelOffer {
   providerName: string;
   model: string;
   note: string;
-  kind?: 'login' | 'codex';
+  kind?: 'login' | 'codex' | 'google';
+  noShell?: boolean;
+  usageScope?: string;
   preset?: string;
   plan: boolean;
   can: { answer: boolean; agent: boolean; image: boolean; vision: boolean };
@@ -795,14 +810,15 @@ export class ProviderManager implements vscode.Disposable, WorkerSource {
         providerId: p.id,
         providerName: p.name,
         model,
-        baseUrl: isNative(p) ? ANTHROPIC_API : isCodex(p) ? '' : p.baseUrl,
+        baseUrl: isNative(p) ? ANTHROPIC_API : isCodex(p) || isGoogle(p) ? '' : p.baseUrl,
         auth: isNative(p) ? ('x-api-key' as const) : p.auth,
         note: notes.get(model) ?? `${model} on ${p.name}`,
         agent: (p.agentWorkers ?? []).includes(model),
         ...(p.preset && { preset: p.preset }),
         ...(isCodex(p) && { kind: 'codex' as const, efforts: p.codexModels?.find((x) => x.id === model)?.efforts, images: p.codexImages }),
+        ...(isGoogle(p) && { kind: 'google' as const, efforts: p.googleModels?.find((x) => x.id === model)?.efforts, images: p.googleImages, noShell: true, usageScope: p.googleModels?.find((x) => x.id === model)?.usageScope }),
         // Billed to a plan, not per token: spent first by the role templates (roles.ts).
-        plan: p.preset === 'zai' || p.preset === 'poe' || (isCodex(p) && p.codexAuth !== 'api-key'),
+        plan: p.preset === 'zai' || p.preset === 'poe' || isGoogle(p) || (isCodex(p) && p.codexAuth !== 'api-key'),
       }));
     })];
   }
@@ -844,6 +860,13 @@ export class ProviderManager implements vscode.Disposable, WorkerSource {
     const w = this.workers().find((x) => x.id === workerId && x.agent);
     const p = w && this.list().find((x) => x.id === w.providerId);
     if (!w || !p) return undefined;
+    if (isGoogle(p)) {
+      const ctx = await this.googleContext(p.id);
+      if (!ctx) return undefined;
+      // A signed-out `agy -p` doesn't fail: it starts a browser sign-in and hangs. Never launch it signed out.
+      if (!(await agySignedIn(ctx))) throw new Error(`Google AI isn't signed in for ${p.name} — sign in under "Edit or Remove a Provider".`);
+      return { runner: 'google', runModel: w.model, settings: {}, secretEnv: {}, google: { ctx, models: p.googleModels ?? [] } };
+    }
     if (isCodex(p)) {
       const codex = await this.codexContext(p.id);
       return codex ? { runner: 'codex', runModel: w.model, settings: {}, secretEnv: {}, codex } : undefined;
@@ -885,6 +908,20 @@ export class ProviderManager implements vscode.Disposable, WorkerSource {
     return { bin, home: own ? keyCodexHome(workingRoot(), p.id) : userCodexHome(), env: {}, auth: 'chatgpt', efforts, own };
   }
 
+  /** WorkerSource: agy uses only this provider's own sign-in, or the host's when chosen. */
+  async googleContext(providerId: string): Promise<AgyContext | undefined> {
+    const p = this.list().find((x) => x.id === providerId);
+    if (!p || !isGoogle(p)) return undefined;
+    const bin = await agyBinary();
+    if (!bin) return undefined;
+    const own = !sharesUserGoogle(p);
+    return { bin, home: own ? agyHome(workingRoot(), p.id) : undefined, own };
+  }
+
+  googleModels(providerId: string): AgyModel[] {
+    return this.list().find((p) => p.id === providerId)?.googleModels ?? [];
+  }
+
   /**
    * Every model this account's providers can serve as a worker, with what each
    * can do and whether it's enabled. Capabilities come from the providers
@@ -905,17 +942,23 @@ export class ProviderManager implements vscode.Disposable, WorkerSource {
     for (const p of this.list()) {
       const on = new Set(p.workers ?? []);
       const agentOn = new Set(p.agentWorkers ?? []);
-      const plan = p.preset === 'zai' || p.preset === 'poe' || (isCodex(p) && p.codexAuth !== 'api-key');
+      const plan = p.preset === 'zai' || p.preset === 'poe' || isGoogle(p) || (isCodex(p) && p.codexAuth !== 'api-key');
       for (const c of workerChoices(p)) {
         const cm = isCodex(p) ? p.codexModels?.find((m) => m.id === c.model) : undefined;
-        const image = isCodex(p) && p.codexImages !== false;
+        const image = (isCodex(p) && p.codexImages !== false) || (isGoogle(p) && p.googleImages !== false);
         const limits: string[] = [];
+        if (isGoogle(p)) {
+          limits.push("agent tasks edit files only — Google AI's agy can't run commands safely (it lets a model retry a refused command outside its sandbox)");
+          if (p.googleImages === false) limits.push('images: this account has no image generation');
+          else if (p.googleImages === undefined) limits.push('images: not checked yet');
+          if (image) limits.push('images: 1024×1024 JPEG, no real transparency');
+        }
         if (isCodex(p) && p.codexImages === false) limits.push('images: this account has no image generation');
         if (isCodex(p) && p.codexImages === undefined) limits.push('images: not checked yet');
         out.push({
           id: workerId(p, c.model), providerId: p.id, providerName: p.name, model: c.model, note: c.note,
-          ...(isCodex(p) && { kind: 'codex' as const }), ...(p.preset && { preset: p.preset }), plan,
-          can: { answer: true, agent: true, image, vision: isCodex(p) ? Boolean(cm?.vision) : /claude/i.test(c.model) || isNative(p) },
+          ...(isCodex(p) && { kind: 'codex' as const }), ...(isGoogle(p) && { kind: 'google' as const, noShell: true, usageScope: p.googleModels?.find((m) => m.id === c.model)?.usageScope }), ...(p.preset && { preset: p.preset }), plan,
+          can: { answer: true, agent: true, image, vision: isGoogle(p) ? /gemini|claude/i.test(c.model) : isCodex(p) ? Boolean(cm?.vision) : /claude/i.test(c.model) || isNative(p) },
           limits,
           enabled: on.has(c.model), agentEnabled: agentOn.has(c.model),
         });
@@ -945,7 +988,7 @@ export class ProviderManager implements vscode.Disposable, WorkerSource {
         `(billed to its key, or counted toward its plan).\n` +
         (agents
           ? `• Agent tasks run that model headless in a scratch git worktree of your repo — reading and editing files ` +
-            `there and running commands (Claude Code in auto mode, or Codex in its sandbox). Nothing reaches your ` +
+            `there (Google AI: edit-only, no shell; Claude Code: auto mode; Codex: commands in its sandbox). Nothing reaches your ` +
             `working tree unless the lead applies the diff.\n`
           : '') +
         `• Off again any time under "Edit or Remove a Provider → Workers".`,
@@ -970,6 +1013,22 @@ export class ProviderManager implements vscode.Disposable, WorkerSource {
     log(`orchestration: enabled ${need.map((o) => o.id).join(', ')}`);
     this.onDidChange.fire();
     return true;
+  }
+
+  /** Refresh Google's catalog quietly; check image generation only until it is known. */
+  async ensureGoogleFacts(): Promise<void> {
+    for (const p of this.list()) {
+      if (!isGoogle(p)) continue;
+      const ctx = await this.googleContext(p.id);
+      if (!ctx) {
+        void this.noticeMissingGoogle();
+        continue;
+      }
+      const catalog = await agyModels(ctx);
+      if (!catalog.signedIn) continue;
+      const images = p.googleImages ?? await agyImageSupport(ctx, catalog.models);
+      await this.save(this.list().map((x) => x.id === p.id ? { ...x, googleModels: catalog.models, ...(images !== undefined && { googleImages: images }) } : x));
+    }
   }
 
   /** Codex facts older versions didn't record (image generation, vision), read quietly once. */
@@ -1027,10 +1086,10 @@ export class ProviderManager implements vscode.Disposable, WorkerSource {
       const port = /^http:\/\/127\.0\.0\.1:(\d+)$/.exec(base)?.[1];
       if (port) return Number(port) === proxyPort(p.id);
       if (isNative(p)) return base === ANTHROPIC_API && Boolean(env.ANTHROPIC_API_KEY) && natives.length === 1;
-      return !isCodex(p) && base === norm(p.baseUrl);
+      return !isCodex(p) && !isGoogle(p) && base === norm(p.baseUrl);
     };
     for (const p of this.list()) {
-      if ((isCodex(p) && p.codexAuth !== 'api-key') || (await this.keyFor(p.id))) continue;
+      if (isGoogle(p) || (isCodex(p) && p.codexAuth !== 'api-key') || (await this.keyFor(p.id))) continue;
       for (const w of windows) {
         if (/^http:\/\/127\.0\.0\.1:/.test(w.env.ANTHROPIC_BASE_URL)) continue; // holds the proxy's key, not the provider's
         const key = servedBy(p, w.env) ? (isNative(p) ? w.env.ANTHROPIC_API_KEY : w.env.ANTHROPIC_AUTH_TOKEN || w.env.ANTHROPIC_API_KEY) : '';
@@ -1056,7 +1115,7 @@ export class ProviderManager implements vscode.Disposable, WorkerSource {
   async promptMissingKeys(): Promise<void> {
     const missing: Provider[] = [];
     for (const p of this.list()) {
-      if (isCodex(p) && p.codexAuth !== 'api-key') continue; // Codex's own sign-in
+      if (isGoogle(p) || (isCodex(p) && p.codexAuth !== 'api-key')) continue; // the CLI's own sign-in
       if (!(await this.keyFor(p.id))) missing.push(p);
     }
     if (missing.length === 0) return;
@@ -1233,6 +1292,9 @@ export class ProviderManager implements vscode.Disposable, WorkerSource {
   /** Points this window at `provider` (undefined = its Anthropic login) and reloads it. */
   private async useInWindow(provider: Provider | undefined): Promise<void> {
     let desired: ProviderSettings | undefined;
+    if (provider && isGoogle(provider)) {
+      throw new Error(`${provider.name} runs on your Google AI plan, which only Antigravity itself may use — it can't serve a chat window.`);
+    }
     if (provider && !chatCapable(provider)) {
       throw new Error(`${provider.name} runs on your ChatGPT plan, which only Codex itself may use — it can't serve a chat window. Add OpenAI Codex with an API key for that.`);
     }
@@ -1442,7 +1504,7 @@ export class ProviderManager implements vscode.Disposable, WorkerSource {
   }
 
   async addInteractive(): Promise<void> {
-    type Choice = 'anthropic' | GatewayPreset | 'codex' | 'custom';
+    type Choice = 'anthropic' | GatewayPreset | 'codex' | 'google' | 'custom';
     const choice = (
       await vscode.window.showQuickPick<vscode.QuickPickItem & { choice: Choice }>(
         [
@@ -1464,6 +1526,12 @@ export class ProviderManager implements vscode.Disposable, WorkerSource {
             choice: 'codex',
           },
           {
+            label: '$(hubot) Google AI (Antigravity)',
+            description: 'workers and edit-only agent tasks',
+            detail: 'Gemini and other models through agy on your Google AI plan — only Antigravity uses its sign-in; CPPO never reads it. Gemini API keys bill separately.',
+            choice: 'google',
+          },
+          {
             label: '$(gear) Custom Anthropic-compatible gateway',
             detail: 'A company proxy or any other endpoint — a base URL and a key',
             choice: 'custom',
@@ -1475,6 +1543,7 @@ export class ProviderManager implements vscode.Disposable, WorkerSource {
     if (!choice) return;
     if (choice === 'anthropic') return this.addAnthropicKey();
     if (choice === 'codex') return this.addCodex();
+    if (choice === 'google') return this.addGoogle();
     return this.addGateway(choice === 'custom' ? undefined : choice);
   }
 
@@ -1554,16 +1623,16 @@ export class ProviderManager implements vscode.Disposable, WorkerSource {
    * service, say plainly that several accounts or keys with one service, used to
    * get around its limits, can break its terms. Other Claude accounts on the host
    * don't count — a work account and a personal one are separate purposes. Two
-   * Codex providers on the same host sign-in are one ChatGPT account, not two.
+   * Codex or Google AI providers sharing the host sign-in use one service account, not two.
    * The user decides. False if they cancel.
    */
   private async termsCheck(p: Provider): Promise<boolean> {
     const svc = serviceOf(p);
     const existing = this.list().filter(
-      (x) => x.id !== p.id && serviceOf(x).key === svc.key && !(sharesUserCodex(p) && sharesUserCodex(x))
+      (x) => x.id !== p.id && serviceOf(x).key === svc.key && !(sharesUserCodex(p) && sharesUserCodex(x)) && !(sharesUserGoogle(p) && sharesUserGoogle(x))
     );
     if (existing.length === 0) return true;
-    const what = isCodex(p) && p.codexAuth !== 'api-key' ? 'ChatGPT account' : 'key';
+    const what = isGoogle(p) ? 'Google AI account' : isCodex(p) && p.codexAuth !== 'api-key' ? 'ChatGPT account' : 'key';
     log(`provider: another ${svc.label} ${what} in this Claude account (already: ${existing.map((x) => x.name).join(', ')}) — terms warning shown`);
     const ok = await vscode.window.showWarningMessage(
       `This Claude account already has ${svc.label}: ${existing.map((x) => `"${x.name}"`).join(', ')}.\n\n` +
@@ -1574,6 +1643,159 @@ export class ProviderManager implements vscode.Disposable, WorkerSource {
       'Add it anyway'
     );
     return ok === 'Add it anyway';
+  }
+
+  /**
+   * agy's path. When it's missing: say what the installer needs that this host
+   * lacks, offer the install command in a terminal (shown, never run for the user)
+   * and wait for them to say it's done. Undefined if they give up.
+   */
+  private async ensureAgy(why: string): Promise<string | undefined> {
+    for (;;) {
+      const bin = await agyBinary();
+      if (bin) return bin;
+      const blockers = await agyInstallBlockers();
+      const pick = await vscode.window.showWarningMessage(
+        `${why} Google AI runs through Antigravity's CLI (agy), which isn't on this host.` +
+          (blockers.length ? ` Its installer needs ${blockers.join(', ')}, which this host lacks — install that first.` : ' CPPO shows the installer in a terminal and never runs it for you.'),
+        ...(blockers.length ? ['Check again'] : ['Open install terminal', 'Check again'])
+      );
+      if (pick === 'Open install terminal') {
+        const t = vscode.window.createTerminal('Install Antigravity');
+        t.show();
+        t.sendText(AGY_INSTALL_COMMAND, false);
+        if (!(await vscode.window.showInformationMessage('Press Enter in the terminal to run the installer. When it has finished, choose Check again.', 'Check again'))) return undefined;
+      } else if (pick !== 'Check again') return undefined;
+    }
+  }
+
+  private missingGoogleNoticed = false;
+
+  /** A Google AI provider exists but agy is gone from this host: say so once a session, with the install offer. */
+  async noticeMissingGoogle(): Promise<void> {
+    if (this.missingGoogleNoticed || !this.list().some(isGoogle) || (await agyBinary())) return;
+    this.missingGoogleNoticed = true;
+    if (await this.ensureAgy("Your Google AI provider can't run.")) this.onDidChange.fire();
+  }
+
+  /** Google AI plans are used only by Antigravity itself; CPPO never reads its sign-in. */
+  private async addGoogle(): Promise<void> {
+    const bin = await this.ensureAgy('Adding Google AI needs it.');
+    if (!bin) return;
+    const users = this.sharedGoogleUsers();
+    const home = (await vscode.window.showQuickPick([
+      { label: '$(shield) Its own Google AI sign-in (recommended)', detail: 'A private HOME for this provider alone — keep personal and work sign-ins separate. Only Antigravity uses the plan; CPPO never reads its sign-in.', mode: 'own' as const },
+      { label: "$(account) This host's Google AI sign-in", detail: `One sign-in per Linux user, whatever Claude account is active${users.length ? `; also used by ${users.join(', ')}` : ''}.`, mode: 'shared' as const },
+    ], { title: 'Add Google AI: whose sign-in?' }))?.mode;
+    if (!home) return;
+    let orphan: { id: string; dir: string } | undefined;
+    if (home === 'own') {
+      const all = this.state.get<Record<string, Provider[]>>('claudeProfiles.providers', {});
+      const referenced = new Set(Object.values(all).flatMap((list) => list.map((p) => p.id)));
+      const found = findOrphanAgyHomes(workingRoot(), referenced);
+      if (found.length) {
+        const pick = await vscode.window.showQuickPick([
+          { label: '$(add) A new sign-in', description: 'Sign in for this provider alone', orphan: undefined as typeof orphan },
+          ...found.map((o) => ({ label: `$(account) Reuse ${o.id}`, description: 'An existing private sign-in no provider references', orphan: o })),
+        ], { title: 'Add Google AI: reuse a sign-in found on this host?' });
+        if (!pick) return;
+        orphan = pick.orphan;
+      }
+    }
+    const name = await vscode.window.showInputBox({
+      title: 'Add Google AI: name', value: 'Google AI',
+      prompt: "How workers on it are named and shown in the account's hover",
+      validateInput: (v) => !v.trim() ? 'Enter a name' : this.list().some((p) => p.name === v.trim()) ? 'That name is taken' : undefined,
+    });
+    if (!name) return;
+    const p: Provider = { id: crypto.randomBytes(6).toString('hex'), name: name.trim(), kind: 'google', googleHome: home, baseUrl: '', auth: 'bearer' };
+    if (!await this.termsCheck(p)) return;
+    if (orphan) {
+      const target = agyHome(workingRoot(), p.id);
+      fs.rmdirSync(target);
+      fs.renameSync(orphan.dir, target);
+      log(`provider ${p.name}: reusing the Google AI sign-in found in ${orphan.id}`);
+    }
+    await this.save([...this.list(), p]);
+    log(`provider added: ${p.name} (Google AI, ${home} sign-in, ${bin})`);
+    this.onDidChange.fire();
+    if (!await this.checkGoogle(p)) return;
+    await this.ensureGoogleFacts();
+    const fresh = this.list().find((x) => x.id === p.id)!;
+    const updated = await this.pickWorkers(fresh);
+    if (updated) await this.save(this.list().map((x) => x.id === p.id ? updated : x));
+    this.onDidChange.fire();
+    vscode.window.showInformationMessage(`Added ${p.name}. Pick its workers any time under "Edit or Remove a Provider".`);
+  }
+
+  /** Free sign-in/catalog check: never send a prompt to test a connection. */
+  private async checkGoogle(p: Provider): Promise<boolean> {
+    const ctx = await this.googleContext(p.id);
+    if (!ctx) return (await this.ensureAgy(`${p.name}:`)) ? this.checkGoogle(p) : false;
+    const r = await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: `Checking ${p.name}…` }, () => agyModels(ctx));
+    if (r.signedIn) {
+      await this.save(this.list().map((x) => x.id === p.id ? { ...x, googleModels: r.models } : x));
+      this.onDidChange.fire();
+      log(`provider ${p.name}: Google AI signed in — ${r.models.map((m) => m.id).join(', ')}`);
+      vscode.window.showInformationMessage(`${p.name}: signed in · ${r.models.length} models (${r.models.map((m) => m.name).join(', ')}).`);
+      return true;
+    }
+    const pick = await vscode.window.showWarningMessage(`${p.name}: not signed in. ${r.message ?? 'Sign in with agy, then check again.'}`, 'Sign in to Google AI', 'Check again');
+    if (pick === 'Sign in to Google AI') return this.signInGoogle(p);
+    if (pick === 'Check again') return this.checkGoogle(p);
+    return false;
+  }
+
+  private async signInGoogle(p: Provider): Promise<boolean> {
+    const ctx = await this.googleContext(p.id);
+    if (!ctx) return false;
+    const t = vscode.window.createTerminal('Sign in to Google AI');
+    t.show();
+    t.sendText(agySignInCommand(ctx));
+    const pick = await vscode.window.showInformationMessage(
+      `Finish signing in to Google AI in the terminal, then leave agy or close that terminal once it shows you signed in.${ctx.own ? ' The browser it opens may be a fresh profile for this private sign-in.' : ''} Only Antigravity uses your plan; CPPO never reads its sign-in.`,
+      'Check again'
+    );
+    return pick === 'Check again' ? this.checkGoogle(p) : false;
+  }
+
+  private sharedGoogleUsers(): string[] {
+    const all = this.state.get<Record<string, Provider[]>>('claudeProfiles.providers', {});
+    return Object.entries(all).flatMap(([email, list]) => list.filter(sharesUserGoogle).map((p) => `"${p.name}" (${email})`));
+  }
+
+  private async setGoogleHome(p: Provider, mode: 'own' | 'shared'): Promise<void> {
+    const updated = { ...p, googleHome: mode, googleModels: undefined, googleImages: undefined };
+    await this.save(this.list().map((x) => x.id === p.id ? updated : x));
+    const ack = this.state.get<Record<string, boolean>>('claudeProfiles.googleSharedAck', {});
+    if (mode === 'shared') ack[p.id] = true;
+    else delete ack[p.id];
+    await this.state.update('claudeProfiles.googleSharedAck', ack);
+    if (mode === 'shared') fs.rmSync(path.join(workingRoot(), 'agy', p.id), { recursive: true, force: true });
+    this.onDidChange.fire();
+    if (await this.checkGoogle(updated)) await this.ensureGoogleFacts();
+  }
+
+  /** Offer separate sign-ins when work and personal Claude accounts share this Linux user's Google sign-in. */
+  async noticeSharedGoogle(): Promise<void> {
+    const all = this.state.get<Record<string, Provider[]>>('claudeProfiles.providers', {});
+    const shared = Object.entries(all).flatMap(([email, list]) => list.filter(sharesUserGoogle).map((p) => ({ p, email })));
+    if (new Set(shared.map((s) => s.email)).size < 2) return;
+    const ack = this.state.get<Record<string, boolean>>('claudeProfiles.googleSharedAck', {});
+    for (const p of this.list().filter((x) => sharesUserGoogle(x) && !ack[x.id])) {
+      const others = shared.filter((s) => s.email !== this.email()).map((s) => `"${s.p.name}" (${s.email})`);
+      const pick = await vscode.window.showWarningMessage(
+        `${p.name} uses this host's one Google AI sign-in, which ${others.join(', ')} — under another Claude account — uses too. ` +
+          `That's whichever Google AI account agy is signed in as, for every Claude account on this Linux user. If these are meant to be ` +
+          `different accounts (a work one and a personal one), give ${p.name} its own sign-in.`,
+        'Give it its own sign-in', 'Keep sharing'
+      );
+      if (pick === 'Give it its own sign-in') await this.setGoogleHome(p, 'own');
+      else if (pick === 'Keep sharing') {
+        ack[p.id] = true;
+        await this.state.update('claudeProfiles.googleSharedAck', ack);
+      }
+    }
   }
 
   /**
@@ -2010,6 +2232,7 @@ export class ProviderManager implements vscode.Disposable, WorkerSource {
   private async pickWorkers(target: Provider): Promise<Provider | undefined> {
     const updated: Provider = { ...target };
     const codex = isCodex(target);
+    const google = isGoogle(target);
     const choices = workerChoices(target);
     if (choices.length === 0) {
       vscode.window.showInformationMessage(`${target.name} has no models to offer as workers yet — set its model aliases first.`);
@@ -2028,7 +2251,7 @@ export class ProviderManager implements vscode.Disposable, WorkerSource {
     const models = picked.map((i) => i.label);
     const adding = models.filter((m) => !on.has(m));
     if (adding.length > 0) {
-      const billing = codex
+      const billing = google ? "Google AI, counted toward your Google AI plan's limits" : codex
         ? target.codexAuth === 'api-key'
           ? 'OpenAI, billed to this API key'
           : "OpenAI, counted toward your ChatGPT plan's Codex limits"
@@ -2036,7 +2259,9 @@ export class ProviderManager implements vscode.Disposable, WorkerSource {
       const ok = await vscode.window.showWarningMessage(
         `Let Claude Code in this account's windows send work to ${target.name} (${adding.join(', ')})?\n\n` +
           `• The AI decides what to send: the task and the code or text it pastes in — that content goes to ${billing}.\n` +
-          (codex
+          (google
+            ? '• Each call runs agy itself in an empty folder, with shell and URL actions refused. Only Antigravity uses the plan; CPPO never reads its sign-in.\n'
+            : codex
             ? '• Each call runs Codex itself, headless, read-only in an empty folder, with its shell and other tools off: it only answers.\n'
             : '• Workers only answer. They cannot read your files or run commands.\n') +
           `• Off again any time here; the window log records each call (not its content).`,
@@ -2056,7 +2281,9 @@ export class ProviderManager implements vscode.Disposable, WorkerSource {
       models.map((m) => ({ label: m, picked: agentOn.has(m) })),
       {
         title: `${target.name}: which of these may also run AGENT TASKS?`,
-        placeHolder: codex
+        placeHolder: google
+          ? 'Agent tasks run agy in a scratch git worktree: edit-only, no shell, no builds or tests. None = answers only.'
+          : codex
           ? 'Agent tasks run Codex on this model in a scratch git worktree, with edits and commands (its sandbox, approvals reviewed automatically). None = answers only.'
           : 'Agent tasks run Claude Code on this model in a scratch git worktree, with edits and commands (auto mode). None = answers only.',
         canPickMany: true,
@@ -2067,7 +2294,9 @@ export class ProviderManager implements vscode.Disposable, WorkerSource {
     if (newAgents.length > 0) {
       const ok = await vscode.window.showWarningMessage(
         `Let ${target.name} (${newAgents.join(', ')}) run agent tasks?\n\n` +
-          (codex
+          (google
+            ? `• agy runs on that model in a scratch git worktree (HEAD + uncommitted changes), reading and editing files only. Shell commands and URL actions are refused. The lead must run builds and tests. Only Antigravity uses the plan; CPPO never reads its sign-in.\n`
+            : codex
             ? `• Codex runs on that model, headless, in a git worktree made from your repo (HEAD + uncommitted ` +
               `changes). It reads and edits files there and runs commands in its sandbox: writes only inside the ` +
               `worktree, no network for commands. Its approval requests are reviewed automatically (--approve-for-me).\n`
@@ -2111,7 +2340,7 @@ export class ProviderManager implements vscode.Disposable, WorkerSource {
     const target = chosen.provider;
     if (!target) return;
 
-    type Action = 'test' | 'workers' | 'key' | 'url' | 'auth' | 'models' | 'others' | 'refresh' | 'proxylog' | 'betas' | 'rename' | 'remove' | 'signin' | 'codexmodels' | 'chatmodels' | 'codexhome';
+    type Action = 'test' | 'workers' | 'key' | 'url' | 'auth' | 'models' | 'others' | 'refresh' | 'proxylog' | 'betas' | 'rename' | 'remove' | 'signin' | 'codexmodels' | 'chatmodels' | 'codexhome' | 'googlehome' | 'googlemodels';
     type ActionItem = vscode.QuickPickItem & { action: Action };
     const common = (items: ActionItem[]): ActionItem[] => [
       { label: '$(pulse) Test connection', description: 'one tiny request, as Claude Code sends it', action: 'test' },
@@ -2130,7 +2359,17 @@ export class ProviderManager implements vscode.Disposable, WorkerSource {
     ];
     const action = (
       await vscode.window.showQuickPick<ActionItem>(
-        isCodex(target)
+        isGoogle(target)
+          ? [
+              { label: '$(pulse) Test connection', description: 'sign-in and models only — no prompt', action: 'test' },
+              { label: '$(organization) Workers', description: target.workers?.join(', ') || 'off', action: 'workers' },
+              { label: '$(refresh) Refresh models', description: `${target.googleModels?.length ?? 0} families`, action: 'googlemodels' },
+              { label: '$(account) Sign in to Google AI', description: sharesUserGoogle(target) ? "this host's shared sign-in" : 'its own sign-in', action: 'signin' },
+              { label: sharesUserGoogle(target) ? '$(shield) Give it its own sign-in' : "$(account) Use this host's Google AI sign-in instead", action: 'googlehome' },
+              { label: '$(edit) Rename', action: 'rename' },
+              { label: '$(trash) Remove', action: 'remove' },
+            ]
+          : isCodex(target)
           ? [
               { label: '$(pulse) Test connection', description: target.codexAuth === 'api-key' ? 'checks the API key' : 'who Codex is signed in as', action: 'test' },
               {
@@ -2230,8 +2469,25 @@ export class ProviderManager implements vscode.Disposable, WorkerSource {
         break;
       }
       case 'signin':
+        if (isGoogle(target)) { await this.signInGoogle(target); return; }
         await this.checkCodex(target);
         return;
+      case 'googlemodels':
+        await this.ensureGoogleFacts();
+        this.onDidChange.fire();
+        return;
+      case 'googlehome': {
+        const mode = sharesUserGoogle(target) ? 'own' : 'shared';
+        const users = this.sharedGoogleUsers();
+        const ok = await vscode.window.showWarningMessage(
+          mode === 'own'
+            ? `Give ${target.name} its own Google AI sign-in? It will ask you to sign in separately, for example to keep work and personal accounts apart.`
+            : `Use this host's Google AI sign-in for ${target.name}? There is one sign-in per Linux user, whatever Claude account is active${users.length ? ` (also used by ${users.join(', ')})` : ''}. Its own sign-in is removed.`,
+          { modal: true }, 'Change sign-in'
+        );
+        if (ok === 'Change sign-in') await this.setGoogleHome(target, mode);
+        return;
+      }
       case 'codexhome': {
         if (sharesUserCodex(target)) {
           const ok = await vscode.window.showWarningMessage(
@@ -2265,6 +2521,7 @@ export class ProviderManager implements vscode.Disposable, WorkerSource {
         vscode.window.showInformationMessage(`${target.name}: model list refreshed.`);
         return;
       case 'test': {
+        if (isGoogle(target)) { await this.checkGoogle(target); return; }
         if (isCodex(target)) {
           await this.checkCodex(target);
           return;
@@ -2405,8 +2662,10 @@ export class ProviderManager implements vscode.Disposable, WorkerSource {
       }
       case 'remove': {
         const ok = await vscode.window.showWarningMessage(
-          `Remove ${target.name}? Its key is deleted from secret storage, and every window using it goes ` +
-            `back to its Anthropic login.`,
+          isGoogle(target)
+            ? `Remove ${target.name}? ${sharesUserGoogle(target) ? "This host's shared Google AI sign-in stays in place." : 'Its private Google AI sign-in is removed.'}`
+            : `Remove ${target.name}? Its key is deleted from secret storage, and every window using it goes ` +
+              `back to its Anthropic login.`,
           { modal: true },
           'Remove'
         );
@@ -2414,6 +2673,7 @@ export class ProviderManager implements vscode.Disposable, WorkerSource {
         await this.save(this.list().filter((p) => p.id !== target.id));
         await this.context.secrets.delete(this.secretKey(target.id));
         await stopProxy(target.id);
+        if (isGoogle(target) && !sharesUserGoogle(target)) fs.rmSync(path.join(workingRoot(), 'agy', target.id), { recursive: true, force: true });
         if (isCodex(target) && !sharesUserCodex(target)) {
           fs.rmSync(path.join(workingRoot(), 'codex', target.id), { recursive: true, force: true }); // its own sign-in or key: nothing left behind
         }

@@ -256,7 +256,7 @@ export class StatusBarManager implements vscode.Disposable {
               .map((w) => {
                 const n = this.transcripts?.count(w.id) ?? 0;
                 const link = `[${w.id}](command:cppo.showWorkerTranscripts?${encodeURIComponent(JSON.stringify([w.id]))} "Its tasks and consultations in this window")`;
-                return `${link}${n ? ` (${n})` : ''}${w.agent ? ' _(+agent tasks)_' : ''}`;
+                return `${link}${w.kind === 'google' ? ' (Google AI plan; edit-only)' : ''}${n ? ` (${n})` : ''}${w.agent ? ' _(+agent tasks)_' : ''}`;
               })
               .join(', ')}`
           : '',

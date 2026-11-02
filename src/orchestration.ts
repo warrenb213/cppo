@@ -101,6 +101,7 @@ export class OrchestrationPanel {
   private async post(refreshUsage = false, draft?: RolePolicy): Promise<void> {
     if (!this.factsRead) {
       this.factsRead = true;
+      await this.deps.providers.ensureGoogleFacts().catch((err) => log(`orchestration: Google AI facts — ${(err as Error).message}`));
       await this.deps.providers.ensureCodexFacts().catch((err) => log(`orchestration: Codex facts — ${(err as Error).message}`));
     }
     const enabled = this.deps.providers.workers();
@@ -121,7 +122,7 @@ export class OrchestrationPanel {
         skipped: r?.skipped.map((s) => `${s.worker}: ${s.reason}`) ?? [],
       };
     }
-    const providers = [...new Set(offers.map((o) => o.providerName))].map((name) => ({ name, usage: book.get(name) }));
+    const providers = [...new Set(offers.map((o) => o.providerName))].map((name) => ({ name, usage: book.get(name), plan: offers.some((o) => o.providerName === name && o.kind === 'google') ? 'Google AI plan' : undefined }));
     void this.panel.webview.postMessage({
       type: 'state',
       account: this.deps.account(),
@@ -149,7 +150,7 @@ export class OrchestrationPanel {
 function asWorker(o: ModelOffer): Worker {
   return {
     id: o.id, providerId: o.providerId, providerName: o.providerName, model: o.model, baseUrl: '', auth: 'bearer', note: o.note,
-    agent: o.can.agent, plan: o.plan, images: o.can.image,
+    agent: o.can.agent, plan: o.plan, images: o.can.image, noShell: o.noShell, usageScope: o.usageScope,
     ...(o.kind && { kind: o.kind }), ...(o.preset && { preset: o.preset }),
   };
 }
@@ -236,7 +237,7 @@ function renderInventory() {
   const caps = (o) => [['answer', 'answers'], ['agent', 'agent tasks'], ['image', 'images'], ['vision', 'sees images']].filter(([k]) => o.can[k]).map(([, t]) => $('span', { class: 'badge' }, t));
   const status = (o) => !o.enabled ? $('span', { class: 'muted' }, 'not enabled') : $('span', {}, o.agentEnabled ? 'worker + agent tasks' : 'worker');
   const provs = S.providers.map((p) => $('div', { class: 'card' },
-    $('div', { class: 'row' }, $('b', {}, p.name), p.usage && p.usage.plan ? $('span', { class: 'badge' }, p.usage.plan) : null),
+    $('div', { class: 'row' }, $('b', {}, p.name), (p.usage && p.usage.plan) || p.plan ? $('span', { class: 'badge' }, (p.usage && p.usage.plan) || p.plan) : null),
     $('table', {}, ...S.offers.filter((o) => o.providerName === p.name).map((o) => $('tr', { class: o.unavailable ? 'err' : '' }, $('td', {}, $('b', {}, o.model)), $('td', {}, ...caps(o)), $('td', {}, status(o), o.unavailable ? ' — ' + o.unavailable : '', ...o.limits.map((l) => $('div', { class: 'muted' }, l)))))),
     p.usage ? $('div', {}, ...p.usage.windows.map((x) => $('div', { class: 'row' }, $('span', { class: 'muted' }, x.label), $('div', { class: 'track' }, $('div', { class: 'bar', style: 'width:' + Math.min(100, x.usedPct) + '%' })), $('span', { class: x.usedPct >= 90 ? 'warn' : '' }, Math.round(x.usedPct) + '%'), x.resetsAt ? $('span', { class: 'muted' }, 'resets in ' + until(x.resetsAt)) : null)), $('div', { class: 'muted' }, p.usage.source)) : $('div', { class: 'muted' }, p.name === 'Anthropic login' ? "No usage report from Claude Code yet — it caches one as you use it (/usage)." : 'No plan usage reported.')));
   inv.replaceChildren($('div', { class: 'grid' }, acct, ...provs),
@@ -267,7 +268,7 @@ function renderRoles() {
       $('div', { class: 'row' }, $('b', {}, def.label), $('code', { class: 'muted' }, def.id), $('span', { class: 'badge' }, def.kind === 'answer' ? 'delegate' : def.kind === 'image' ? 'start_task · images' : 'start_task'),
         $('label', { class: 'row', style: 'margin-left:auto' }, $('input', { type: 'checkbox', checked: !role.off, onchange: (ev) => { if (ev.target.checked) delete role.off; else role.off = true; changed(); } }), 'on')),
       $('div', { class: 'muted' }, def.purpose),
-      role.chain.length ? $('table', {}, rows) : $('div', { class: 'warn' }, eligible.length ? 'No models in the chain yet — add one below.' : def.kind === 'image' ? 'None of your providers can generate images (OpenAI Codex on a ChatGPT plan can).' : def.kind === 'agent' ? 'None of your providers can run agent tasks.' : 'No providers yet.'),
+      role.chain.length ? $('table', {}, rows) : $('div', { class: 'warn' }, eligible.length ? 'No models in the chain yet — add one below.' : def.kind === 'image' ? 'None of your providers can generate images (OpenAI Codex on a ChatGPT plan or Google AI can).' : def.kind === 'agent' ? 'None of your providers can run agent tasks.' : 'No providers yet.'),
       unused.length ? $('div', { class: 'row' }, $('select', { id: 'add-' + def.id }, ...unused.map((o) => $('option', { value: o.id }, label(o)))), $('button', { class: 'secondary', onclick: () => { role.chain.push({ worker: document.getElementById('add-' + def.id).value, effort: def.effort }); changed(); } }, role.chain.length ? 'Add fallback' : 'Add model')) : null,
       role.off ? null : $('div', { class: 'served' }, served.order.length ? [dirty ? 'Once saved, served by ' : 'Now served by ', $('b', {}, served.order[0]), served.order.length > 1 ? ', then ' + served.order.slice(1).join(' → ') : ''] : $('span', { class: 'err' }, 'Nothing can serve this right now.'), ...served.skipped.map((s) => $('div', { class: 'muted' }, 'Passed over — ' + s)))));
   }

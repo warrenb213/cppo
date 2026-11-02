@@ -9,6 +9,7 @@ import { decideStop, readTranscriptTail, sessionTasks } from './handoff';
 import { log } from './log';
 import { TASK_LIMITS, type AgentTasks } from './agentTasks';
 import { UsageBook, zaiQuota, fromRateLimitInfo, claudeCodeUsage } from './usage';
+import { AgyContext, AgyModel, agySignedIn, agyUsage, callAgyWorker } from './agy';
 import { callCodexWorker, CodexContext, codexUsage } from './codex';
 import { candidates, CATALOG, clampEffort, Effort, effectivePolicy, roleDef, RolePolicy, Skip, THINKING_BUDGET, worthFallingBack } from './roles';
 
@@ -47,16 +48,21 @@ export interface Worker {
    * 'login': Claude on the window's own Anthropic login — run as headless Claude
    * Code on the account's directory (callLoginWorker), never with its token here.
    * 'codex': GPT through the Codex CLI (codex.ts), on a ChatGPT plan or an API key.
+   * 'google': Google AI through Antigravity's CLI (agy.ts), on its own plan.
    */
-  kind?: 'login' | 'codex';
+  kind?: 'login' | 'codex' | 'google';
   /** The provider's preset, for usage lookups (e.g. 'zai'). */
   preset?: string;
   /** On a subscription (the Anthropic login, a Coding Plan, a ChatGPT plan) rather than billed per token. */
   plan?: boolean;
-  /** Codex: the reasoning efforts the model takes. */
+  /** Codex or Google AI: the reasoning efforts the model takes. */
   efforts?: string[];
-  /** Codex: the account can generate images (2D art). */
+  /** Codex or Google AI: the account can generate images (2D art). */
   images?: boolean;
+  /** Agent tasks on this worker can't run commands. */
+  noShell?: boolean;
+  /** Which group of the provider's usage windows applies to this model. */
+  usageScope?: string;
 }
 
 export interface WorkerSource {
@@ -66,6 +72,9 @@ export interface WorkerSource {
   loginDir(): string | undefined;
   /** How to run Codex for a Codex provider; undefined when it can't (no binary, no key). */
   codexContext(providerId: string): Promise<CodexContext | undefined>;
+  /** Google AI's own CLI and sign-in, and its current model catalog. */
+  googleContext(providerId: string): Promise<AgyContext | undefined>;
+  googleModels(providerId: string): AgyModel[];
   /** The roles the user set (orchestration panel); undefined = the template. */
   rolePolicy(): RolePolicy | undefined;
   /** This account's Claude Code directories and email — where Claude Code caches its plan usage. */
@@ -392,7 +401,7 @@ export class DelegateServer implements vscode.Disposable {
           serverInfo: { name: SERVER_NAME, version: '1' },
           instructions:
             'Other AI models (workers) the user enabled. `delegate` asks one a question (answers only). ' +
-            'Where enabled, start_task runs one as an agent on a scratch worktree of the repo and returns a ' +
+            'Where enabled, start_task runs one as an agent on a scratch worktree of the repo (Google AI: edit-only, no shell; Claude Code: auto mode; Codex: workspace-write sandbox) and returns a ' +
             'diff via wait_task; review it before apply_task_changes. Ask by `role` (list_roles: quick, ' +
             'second-opinion, review, hard-reasoning, implement, test-and-fix, vector-art, 2d-art) so the user\'s ' +
             'choice of model, effort and fallbacks applies. Check workers\' output before relying on it. ' +
@@ -431,7 +440,7 @@ export class DelegateServer implements vscode.Disposable {
       },
       {
         name: 'list_workers',
-        description: 'List the worker models the user enabled, with what each is good for.',
+        description: 'List the worker models the user enabled, with what each is good for and whether agent tasks can run commands (Google AI is edit-only).',
         inputSchema: { type: 'object', properties: {} },
       },
       {
@@ -491,9 +500,9 @@ export class DelegateServer implements vscode.Disposable {
         name: 'start_task',
         description:
           'Start an agent task: a worker model (another provider the user enabled) runs headless on a scratch git ' +
-          "worktree of this repo — HEAD plus the user's uncommitted changes — editing files and running commands: " +
-          'Claude Code in auto mode (actions checked by a safety classifier), or for Codex workers Codex itself in its ' +
-          'workspace-write sandbox (no network for commands). It can consult other workers itself, answers only ' +
+          "worktree of this repo — HEAD plus the user's uncommitted changes — with these runners: " +
+          'Claude Code in auto mode (actions checked by a safety classifier), Google AI through agy (edit-only, no shell), or for Codex workers Codex itself in its ' +
+          'workspace-write sandbox (no network for commands). Where consulting is available, it can ask other workers, answers only ' +
           "(e.g. Claude on the user's subscription). Returns a task_id at once; tasks take minutes. The worker " +
           'sees only its copy and what you put in task/context: gitignored files (scratch folders, build output) ' +
           'are not in it unless listed in `include` — or named in task/context by absolute path, which copies ' +
@@ -504,7 +513,7 @@ export class DelegateServer implements vscode.Disposable {
             role: {
               type: 'string',
               description:
-                'The kind of work — implement, test-and-fix, vector-art, 2d-art (raster images via Codex; ask for the files to be saved in the repo) — see list_roles. Preferred.',
+                'The kind of work — implement, test-and-fix, vector-art, 2d-art (raster images via Codex or Google AI; Google images are collected into assets/generated after the run) — see list_roles. Preferred.',
             },
             worker: { type: 'string', description: `A specific agent-enabled worker instead of a role — see list_workers (at session start: ${ids.join(', ')}).` },
             task: { type: 'string', description: 'The job, stated completely, with how to verify it.' },
@@ -589,7 +598,7 @@ export class DelegateServer implements vscode.Disposable {
     }
     if (name === 'list_workers') {
       const ws = this.source.workers();
-      return text(ws.map((w) => `- ${w.id}: ${w.note} (${w.providerName}, model ${w.model})`).join('\n') || 'No workers are enabled.');
+      return text(ws.map((w) => `- ${w.id}: ${w.note} (${w.providerName}, model ${w.model})${w.agent ? w.noShell ? ' — agent tasks: edit-only, no shell; the lead runs checks' : ' — agent tasks: edits and commands' : ''}`).join('\n') || 'No workers are enabled.');
     }
     if (name === 'provider_usage') return text(await this.usageReport());
     if (this.agents && ['start_task', 'wait_task', 'cancel_task', 'apply_task_changes'].includes(name)) {
@@ -704,7 +713,19 @@ export class DelegateServer implements vscode.Disposable {
     return effectivePolicy(this.source.rolePolicy(), this.source.workers());
   }
 
-  /** Why a worker can't run here right now (no key, no Codex, no account dir) — absent when it can. */
+  /** Share one free Google sign-in probe across a burst of calls. */
+  private readonly googleSignIns = new Map<string, { at: number; signedIn: Promise<boolean> }>();
+
+  private googleSignedIn(providerId: string, ctx: AgyContext): Promise<boolean> {
+    let cached = this.googleSignIns.get(providerId);
+    if (!cached || Date.now() - cached.at > 60_000) {
+      cached = { at: Date.now(), signedIn: agySignedIn(ctx) };
+      this.googleSignIns.set(providerId, cached);
+    }
+    return cached.signedIn;
+  }
+
+  /** Why a worker can't run here right now (no key, CLI, sign-in or account dir) — absent when it can. */
   async unavailable(ws: Worker[]): Promise<Map<string, string>> {
     const out = new Map<string, string>();
     const codex = new Map<string, boolean>();
@@ -714,6 +735,10 @@ export class DelegateServer implements vscode.Disposable {
       } else if (w.kind === 'codex') {
         if (!codex.has(w.providerId)) codex.set(w.providerId, Boolean(await this.source.codexContext(w.providerId)));
         if (!codex.get(w.providerId)) out.set(w.id, 'Codex not available (no `codex` on this host, or no key)');
+      } else if (w.kind === 'google') {
+        const ctx = await this.source.googleContext(w.providerId);
+        if (!ctx) out.set(w.id, 'Google AI not available (no `agy` on this host)');
+        else if (!await this.googleSignedIn(w.providerId, ctx)) out.set(w.id, 'Google AI is not signed in');
       } else if (!(await this.source.keyFor(w.providerId))) {
         out.set(w.id, `no key stored for ${w.providerName}`);
       }
@@ -741,6 +766,11 @@ export class DelegateServer implements vscode.Disposable {
       const ctx = await this.source.codexContext(w.providerId);
       if (!ctx) return { error: `Codex isn't available for ${w.providerName}: no \`codex\` on this host, or no stored API key` };
       run = () => callCodexWorker(ctx, w.model, WORKER_SYSTEM, task, context, CALL_TIMEOUT_MS, clampEffort(effort, w.efforts));
+    } else if (w.kind === 'google') {
+      const ctx = await this.source.googleContext(w.providerId);
+      if (!ctx) return { error: `Google AI isn't available for ${w.providerName}: no \`agy\` on this host` };
+      if (!await this.googleSignedIn(w.providerId, ctx)) return { error: 'Google AI is not signed in' };
+      run = () => callAgyWorker(ctx, w.model, WORKER_SYSTEM, task, context, CALL_TIMEOUT_MS, clampEffort(effort, w.efforts), this.source.googleModels(w.providerId));
     } else {
       const key = await this.source.keyFor(w.providerId);
       if (!key) return { error: `no key is stored for ${w.providerName}` };
@@ -772,7 +802,7 @@ export class DelegateServer implements vscode.Disposable {
     }
   }
 
-  /** Plan usage, freshened when older than five minutes (or now, with `force`) — Codex and Z.ai can be read any time. */
+  /** Plan usage, freshened when older than five minutes (or now, with `force`) — Codex, Google AI and Z.ai can be read any time. */
   async refreshUsage(force = false): Promise<void> {
     // The Anthropic plan: Claude Code's own cached report, whenever it's fresher than what we have.
     const { dirs, email } = this.source.claudeUsageDirs();
@@ -781,13 +811,17 @@ export class DelegateServer implements vscode.Disposable {
     if (cc && (!had || cc.at > had.at)) this.usage.set(LOGIN_PROVIDER, cc);
     const seen = new Set<string>();
     for (const w of this.source.workers()) {
-      if ((w.preset !== 'zai' && w.kind !== 'codex') || seen.has(w.providerId)) continue;
+      if ((w.preset !== 'zai' && w.kind !== 'codex' && w.kind !== 'google') || seen.has(w.providerId)) continue;
       seen.add(w.providerId);
       const e = this.usage.get(w.providerName);
       if (e && !force && Date.now() - e.at < 300_000) continue;
       if (w.kind === 'codex') {
         const ctx = await this.source.codexContext(w.providerId);
         const u = ctx ? await codexUsage(ctx) : undefined;
+        if (u) this.usage.set(w.providerName, u);
+      } else if (w.kind === 'google') {
+        const ctx = await this.source.googleContext(w.providerId);
+        const u = ctx ? await agyUsage(ctx) : undefined;
         if (u) this.usage.set(w.providerName, u);
       } else {
         const key = await this.source.keyFor(w.providerId);

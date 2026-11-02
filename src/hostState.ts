@@ -46,6 +46,8 @@ const KEYS = [
   'claudeProfiles.roles',
   /** Codex providers whose shared host sign-in the user already confirmed (by provider id). */
   'claudeProfiles.codexSharedAck',
+  /** Google AI providers whose shared host sign-in the user already confirmed. */
+  'claudeProfiles.googleSharedAck',
 ] as const;
 export type HostStateKey = (typeof KEYS)[number];
 

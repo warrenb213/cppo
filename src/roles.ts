@@ -19,7 +19,7 @@ export const EFFORTS: Effort[] = ['low', 'medium', 'high', 'xhigh', 'max'];
 /**
  * What a role needs from a worker. 'answer': any worker (delegate). 'agent': an
  * agent-task worker. 'image': an agent-task worker that can generate images
- * (Codex, whose image generation saves files).
+ * (Codex or Google AI, whose image generation saves files).
  */
 export type RoleKind = 'answer' | 'agent' | 'image';
 
@@ -59,10 +59,12 @@ export const DEFAULT_SKIP_5H = 95;
 export const DEFAULT_SKIP_WEEKLY = 90;
 
 const m = (w: Worker, re: RegExp) => re.test(w.model);
-/** Subscriptions first: the Anthropic login, Z.ai's Coding Plan, Codex on a ChatGPT plan. */
+/** Subscriptions first: the Anthropic login, Z.ai's Coding Plan, Codex on ChatGPT, Google AI. */
 const subscription = (w: Worker) => Boolean(w.plan);
 const fast = /haiku|flash|luna|mini|lite|nano/i;
-const strongest = /opus|astra|ultra/i;
+// "mini" inside Gemini's name doesn't make Argon a quick model.
+const isFast = (w: Worker) => fast.test(w.kind === 'google' ? w.model.replace(/^gemini-/i, '') : w.model);
+const strongest = /opus|astra|ultra|gemini-4-argon/i;
 const workhorse = /sonnet|sol|glm-5\.3(?!-flash)|terra/i;
 
 export const CATALOG: RoleDef[] = [
@@ -73,7 +75,7 @@ export const CATALOG: RoleDef[] = [
     kind: 'answer',
     purpose: 'Summaries, bulk rewriting, quick checks — fast and cheap',
     effort: 'low',
-    score: (w) => (m(w, fast) ? 10 : m(w, workhorse) ? 4 : 1) + (subscription(w) ? 2 : 0),
+    score: (w) => (isFast(w) ? 10 : m(w, workhorse) ? 4 : 1) + (subscription(w) ? 2 : 0),
   },
   {
     id: 'second-opinion',
@@ -119,7 +121,7 @@ export const CATALOG: RoleDef[] = [
     kind: 'agent',
     purpose: 'Run the tests, fix what fails, report what was wrong',
     effort: 'medium',
-    score: (w) => (m(w, workhorse) ? 8 : m(w, fast) ? 4 : 5) + (w.preset === 'zai' ? 3 : 0) + (subscription(w) ? 2 : 0),
+    score: (w) => (m(w, workhorse) ? 8 : isFast(w) ? 4 : 5) + (w.preset === 'zai' ? 3 : 0) + (subscription(w) ? 2 : 0),
   },
   {
     id: '2d-art',
@@ -128,7 +130,8 @@ export const CATALOG: RoleDef[] = [
     kind: 'image',
     purpose: 'Raster images — sprites, textures, concept art, icons — generated and saved as files in the worktree',
     effort: 'medium',
-    score: (w) => (m(w, workhorse) ? 6 : 4) + (subscription(w) ? 2 : 0),
+    // Codex's images rank ahead: Google's JPEGs cannot have real transparency.
+    score: (w) => w.kind === 'google' ? (/gemini/i.test(w.model) ? 3 : 1) + (subscription(w) ? 2 : 0) : (m(w, workhorse) ? 6 : 4) + (subscription(w) ? 2 : 0),
   },
   {
     id: 'vector-art',
@@ -147,7 +150,7 @@ export const roleDef = (id: string) => CATALOG.find((r) => r.id === id);
 export function fits(w: Worker, kind: RoleKind): boolean {
   if (kind === 'answer') return true;
   if (!w.agent) return false;
-  return kind === 'agent' || (w.kind === 'codex' && w.images !== false);
+  return kind === 'agent' || ((w.kind === 'codex' || w.kind === 'google') && w.images !== false);
 }
 
 const MAX_CHAIN = 4;
@@ -170,7 +173,7 @@ export function defaultPolicy(workers: Worker[]): RolePolicy {
   return {
     roles: CATALOG.map((def) => {
       const ranked = workers
-        .filter((w) => fits(w, def.kind))
+        .filter((w) => fits(w, def.kind) && !(def.id === 'test-and-fix' && w.noShell))
         .map((w) => ({ w, s: def.score(w) }))
         .filter((x) => x.s > 0)
         .sort((a, b) => b.s - a.s || generation(b.w.model) - generation(a.w.model) || a.w.id.localeCompare(b.w.id));
@@ -242,8 +245,12 @@ export function candidates(
   for (const e of role.chain) {
     const w = workers.find((x) => x.id === e.worker);
     if (!w) continue;
+    if (def.id === 'test-and-fix' && w.noShell) {
+      skipped.push({ worker: e.worker, reason: "can't run commands (edit-only)" });
+      continue;
+    }
     if (!fits(w, def.kind)) {
-      skipped.push({ worker: e.worker, reason: def.kind === 'image' ? 'not a Codex agent-task worker (image generation)' : 'not enabled for agent tasks' });
+      skipped.push({ worker: e.worker, reason: def.kind === 'image' ? 'not a Codex or Google AI agent-task worker (image generation)' : 'not enabled for agent tasks' });
       continue;
     }
     const why = runnable(w);
@@ -255,6 +262,7 @@ export function candidates(
     let over: string | undefined;
     let pressure = 0;
     for (const win of u?.windows ?? []) {
+      if (win.scope && win.scope !== w.usageScope) continue;
       const weekly = /week/i.test(win.label);
       const limit = weekly ? policy.skipWeeklyPct : /5 hour|hour/i.test(win.label) ? policy.skip5hPct : 100;
       pressure = Math.max(pressure, win.usedPct / Math.max(limit, 1));
