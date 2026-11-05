@@ -12,6 +12,7 @@ import { fence, details, clip } from './transcripts';
 import { AgyContext, AgyModel, AgyEvent, AgyDenied, agyAgentArgs, agyPermissions, agyPromptArgs, agyRunEnv, agySlug, collectAgyImages, deniedOf, describeDenied, parseAgyLine, removeAgyMcpConfig, writeAgyMcpConfig } from './agy';
 import { AGENT_DISABLED, CodexContext, CodexEvent, codexShellArgs } from './codex';
 import { clampEffort, Effort } from './roles';
+import { killSession, LIMIT_SNIPPET, sessionPids } from './proc';
 
 /**
  * Agent tasks: a worker that does real work, not just answers.
@@ -28,6 +29,16 @@ import { clampEffort, Effort } from './roles';
  *
  * Auto mode checks each consequential action (commands, network) with a
  * classifier on the worker's own model — about 35K tokens per check on Z.ai.
+ *
+ * A task survives its extension host. The run is a DETACHED process in its own
+ * session, its stream redirected to <dir>/log.jsonl (no pipes that a host exit
+ * would break), wrapped so `timeout` ends it at its wall even with no host
+ * watching. Its state is mirrored to <dir>/task.json after every change, and
+ * the window that owns it (keyed by owner, the window's working dir) re-adopts
+ * a still-running task — or collects one that finished while no host was up —
+ * when the host comes back after a reload, a crash or an SSH reconnect. The
+ * lead can still wait_task/apply_task_changes it by id; dispose() kills
+ * nothing, so the next host always finds the work.
  */
 
 export interface AgentRunSpec {
@@ -51,6 +62,8 @@ type Status = 'queued' | 'running' | 'done' | 'failed' | 'cancelled';
 
 interface Task {
   id: string;
+  /** The window (working dir) that owns this task — only it restores the task after a restart. */
+  owner?: string;
   worker: string;
   task: string;
   context?: string;
@@ -66,6 +79,10 @@ interface Task {
   started: number;
   ended?: number;
   child?: ChildProcess;
+  /** Session leader of the run (the exec'd trampoline): what kill() and liveness use. */
+  pid?: number;
+  /** The extension host process currently managing the run; cleared when it goes away. */
+  supervisor?: number;
   turns: number;
   toolUses: number;
   lastAction?: string;
@@ -105,6 +122,19 @@ interface Task {
   effort?: Effort;
   applied?: boolean;
   waiters: Array<() => void>;
+  // ── Runtime-only (never in task.json) ─────────────────────────────────────
+  /** The log tailer: open fd, byte offset, partial line, and its poll timer. */
+  tail?: { fd: number; offset: number; buf: string; timer?: NodeJS.Timeout };
+  wall?: NodeJS.Timeout;
+  idle?: NodeJS.Timeout;
+  /** For a re-adopted run with no child handle: polls the session for liveness. */
+  poll?: NodeJS.Timeout;
+  /** The runner's own terminal event was seen (Claude `result`, Codex `turn.completed`, Google `result`). */
+  sawResult?: boolean;
+  /** kill() was asked for while replaying a log; applied after the replay. */
+  killPending?: boolean;
+  /** Last task.json written, so unchanged saves are free. */
+  savedJson?: string;
 }
 
 const MAX_RUNNING = 2;
@@ -112,14 +142,15 @@ const MAX_RUNNING = 2;
  * Each run's limits. Real work (a C++ build, then fixing what it reports) runs
  * well past half an hour — two GLM runs were cut off at a 30-minute limit
  * mid-build with ~900 and ~1,900 lines written. The lead can set its own per
- * task within the bounds; a run silent for IDLE_MS is taken as stuck (a Bash
- * call is capped at 10 minutes by Claude Code).
+ * task within the bounds; a run silent for IDLE_MS is taken as stuck. IDLE_MS
+ * is generous on purpose: a run emits nothing while one long command runs (a
+ * build, a test loop — Codex's shell commands have no short cap either).
  */
 export const TASK_LIMITS = {
   minutes: { default: 120, min: 5, max: 480 },
   turns: { default: 300, min: 10, max: 1000 },
 };
-const IDLE_MS = 20 * 60_000;
+const IDLE_MS = 45 * 60_000;
 const KEEP_DAYS = 7;
 const MAX_DIFF_IN_RESULT = 60_000;
 
@@ -362,14 +393,20 @@ export class AgentTasks implements vscode.Disposable {
   private readonly tasks = new Map<string, Task>();
   /** Fires when any task changes — the account's status bar item shows them (statusBar.ts). */
   readonly onDidChange = new vscode.EventEmitter<void>();
+  /** Above 0 while a saved log is replayed: render() and kill() are held back until it ends. */
+  private replaying = 0;
 
   constructor(
+    /** This window's stable identity (its working dir, workdir.ts): only its own tasks are restored to it. */
+    private readonly owner: string,
     private readonly spec: (workerId: string) => Promise<AgentRunSpec | undefined>,
     /** The workers server for runs (restricted token), when it is up. */
     private readonly access?: () => { url: string; token: string } | undefined,
     /** Called when a task ends: worker, input and output tokens (for the usage book). */
     private readonly onTaskDone?: (worker: string, inTok: number, outTok: number) => void
   ) {
+    this.restore();
+    void this.reconcileRestored().catch((err) => log(`agent tasks: restoring after a restart failed — ${(err as Error).message}`));
     this.prune();
   }
 
@@ -387,12 +424,235 @@ export class AgentTasks implements vscode.Disposable {
     return path.join(workingRoot(), 'agent-tasks');
   }
 
-  /** Task folders (patch + log) older than KEEP_DAYS go. */
+  // ── Durable state: task.json ─────────────────────────────────────────────────
+
+  /** The task as it goes into task.json — everything but runtime-only fields; no secrets. */
+  private stateOf(t: Task): Record<string, unknown> {
+    return {
+      v: 1,
+      id: t.id, owner: t.owner, worker: t.worker, task: t.task, context: t.context, after: t.after, result: t.result,
+      status: t.status, repo: t.repo, base: t.base, worktree: t.worktree, started: t.started, ended: t.ended,
+      minutes: t.minutes, maxTurns: t.maxTurns, role: t.role, effort: t.effort, runner: t.runner, model: t.model,
+      pid: t.pid, supervisor: t.supervisor, links: t.links, snapshotNote: t.snapshotNote, error: t.error,
+      cancelling: t.cancelling, applied: t.applied, report: t.report, files: t.files, stat: t.stat,
+      sideEffects: t.sideEffects, patchFile: t.patchFile, costUsd: t.costUsd, inTok: t.inTok, outTok: t.outTok,
+      turns: t.turns, toolUses: t.toolUses, lastText: t.lastText, lastAction: t.lastAction,
+      denied: t.denied, conversationId: t.conversationId,
+      google: t.google ? { ctx: t.google.ctx, mcp: t.google.mcp } : undefined,
+      written: [...t.written],
+    };
+  }
+
+  /** task.json, atomically (tmp + rename), 0o600. Written when queued, at launch, on every status change and at finish. */
+  private save(t: Task): void {
+    const json = JSON.stringify(this.stateOf(t));
+    if (json === t.savedJson) return;
+    t.savedJson = json;
+    try {
+      const tmp = path.join(t.dir, `task.json.${process.pid}.tmp`);
+      fs.writeFileSync(tmp, json, { mode: 0o600 });
+      fs.renameSync(tmp, path.join(t.dir, 'task.json'));
+    } catch {
+      /* best effort — the in-memory task and log.jsonl are the truth while it runs */
+    }
+  }
+
+  /** Reads a task dir's task.json; undefined when there is none (pre-restart-survival tasks) or it is unreadable. */
+  private readState(dir: string): Record<string, unknown> | undefined {
+    try {
+      const parsed = JSON.parse(fs.readFileSync(path.join(dir, 'task.json'), 'utf-8'));
+      return parsed && typeof parsed === 'object' ? (parsed as Record<string, unknown>) : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** Loads this window's not-too-old tasks from disk, so wait/apply/list see them at once. */
+  private restore(): void {
+    let names: string[];
+    try {
+      names = fs.readdirSync(this.root());
+    } catch {
+      return;
+    }
+    for (const name of names) {
+      const dir = path.join(this.root(), name);
+      const j = this.readState(dir);
+      if (!j) continue;
+      // Another window's task, an unknown shape or a task older than KEEP_DAYS: not ours to load.
+      if (j.owner !== this.owner) continue;
+      const started = typeof j.started === 'number' ? j.started : 0;
+      if (Date.now() - started > KEEP_DAYS * 86_400_000) continue;
+      const status = (['queued', 'running', 'done', 'failed', 'cancelled'] as const).includes(j.status as Status) ? (j.status as Status) : 'failed';
+      if (status === 'queued' || status === 'running') {
+        if (typeof j.repo !== 'string' || typeof j.base !== 'string' || typeof j.worktree !== 'string' || typeof j.minutes !== 'number') continue;
+      }
+      const t: Task = {
+        id: typeof j.id === 'string' ? j.id : name,
+        owner: this.owner,
+        worker: typeof j.worker === 'string' ? j.worker : '?',
+        task: typeof j.task === 'string' ? j.task : '',
+        context: typeof j.context === 'string' ? j.context : undefined,
+        after: typeof j.after === 'string' ? j.after : undefined,
+        result: typeof j.result === 'string' ? j.result : undefined,
+        status,
+        dir, repo: typeof j.repo === 'string' ? j.repo : '',
+        base: typeof j.base === 'string' ? j.base : '',
+        worktree: typeof j.worktree === 'string' ? j.worktree : '',
+        started: started || Date.now(),
+        ended: typeof j.ended === 'number' ? j.ended : undefined,
+        pid: typeof j.pid === 'number' ? j.pid : undefined,
+        supervisor: typeof j.supervisor === 'number' ? j.supervisor : undefined,
+        turns: typeof j.turns === 'number' ? j.turns : 0,
+        toolUses: typeof j.toolUses === 'number' ? j.toolUses : 0,
+        lastAction: typeof j.lastAction === 'string' ? j.lastAction : undefined,
+        report: typeof j.report === 'string' ? j.report : undefined,
+        error: typeof j.error === 'string' ? j.error : undefined,
+        costUsd: typeof j.costUsd === 'number' ? j.costUsd : undefined,
+        inTok: typeof j.inTok === 'number' ? j.inTok : undefined,
+        outTok: typeof j.outTok === 'number' ? j.outTok : undefined,
+        patchFile: typeof j.patchFile === 'string' ? j.patchFile : undefined,
+        stat: typeof j.stat === 'string' ? j.stat : undefined,
+        files: Array.isArray(j.files) ? j.files.filter((x): x is string => typeof x === 'string') : undefined,
+        written: new Set(Array.isArray(j.written) ? j.written.filter((x): x is string => typeof x === 'string') : []),
+        sideEffects: Array.isArray(j.sideEffects) ? j.sideEffects.filter((x): x is string => typeof x === 'string') : undefined,
+        links: Array.isArray(j.links) ? j.links.filter((x): x is string => typeof x === 'string') : undefined,
+        snapshotNote: typeof j.snapshotNote === 'string' ? j.snapshotNote : undefined,
+        minutes: typeof j.minutes === 'number' ? j.minutes : TASK_LIMITS.minutes.default,
+        maxTurns: typeof j.maxTurns === 'number' ? j.maxTurns : TASK_LIMITS.turns.default,
+        lastText: typeof j.lastText === 'string' ? j.lastText : undefined,
+        lastOutput: typeof j.lastOutput === 'number' ? j.lastOutput : undefined,
+        cancelling: j.cancelling === true,
+        runner: typeof j.runner === 'string' && (['claude', 'codex', 'google'] as const).includes(j.runner as 'claude' | 'codex' | 'google') ? (j.runner as Task['runner']) : undefined,
+        model: typeof j.model === 'string' ? j.model : undefined,
+        google: j.google && typeof j.google === 'object' && (j.google as { ctx?: AgyContext }).ctx
+          ? { ctx: (j.google as { ctx: AgyContext; mcp?: boolean }).ctx, mcp: (j.google as { mcp?: boolean }).mcp === true }
+          : undefined,
+        conversationId: typeof j.conversationId === 'string' ? j.conversationId : undefined,
+        denied: Array.isArray(j.denied) ? (j.denied as AgyDenied[]) : undefined,
+        googleText: new Map(),
+        role: typeof j.role === 'string' ? j.role : undefined,
+        effort: typeof j.effort === 'string' ? (j.effort as Effort) : undefined,
+        applied: j.applied === true,
+        waiters: [],
+      };
+      t.savedJson = JSON.stringify(this.stateOf(t));
+      this.tasks.set(t.id, t);
+    }
+  }
+
+  /**
+   * Brings the restored tasks in step with reality. Finished ones just need
+   * their patch checked; queued ones can start now; a running one belongs to
+   * another live host (left alone), or is taken over: its log is replayed to
+   * rebuild the live counters, then it is watched again — or, if the run has
+   * already ended, its result is collected from the worktree it left behind.
+   */
+  private async reconcileRestored(): Promise<void> {
+    for (const t of [...this.tasks.values()]) {
+      if (t.status === 'done' || t.status === 'failed' || t.status === 'cancelled') {
+        if (t.patchFile && !fs.existsSync(t.patchFile)) {
+          t.patchFile = undefined;
+          t.result = t.base || t.result;
+          this.save(t);
+        }
+        continue;
+      }
+      if (t.status === 'queued') continue; // promote() below starts it
+      if (!t.pid || !fs.existsSync(t.worktree)) {
+        // A task from before runs survived restarts: its worktree went with the old host.
+        t.status = 'failed';
+        t.error ??= 'its worktree is gone — the extension host stopped before agent tasks survived restarts';
+        t.ended = Date.now();
+        this.save(t);
+        log(`agent task ${t.id}: not re-attached — ${t.error}`);
+        continue;
+      }
+      // Another live host manages it only if that pid is alive AND the run still is — after a reboot a stale
+      // supervisor pid can belong to an unrelated process, and nobody else will ever finish a dead run.
+      if (t.supervisor && t.supervisor !== process.pid && sessionPids(t.pid).length > 0) {
+        try {
+          process.kill(t.supervisor, 0);
+          continue; // another live host is managing it
+        } catch {
+          /* that host is gone — take over */
+        }
+      }
+      t.supervisor = process.pid;
+      const offset = this.replay(t);
+      try {
+        t.tail = { fd: fs.openSync(path.join(t.dir, 'log.jsonl'), 'r'), offset, buf: '' };
+      } catch {
+        t.tail = { fd: -1, offset, buf: '' }; // no log yet; pump tolerates it
+      }
+      if (sessionPids(t.pid).length > 0) {
+        // Still running: re-arm its limits for the time that is left.
+        log(`agent task ${t.id}: re-attached after a restart — running, ${t.turns} ${t.runner === 'codex' || t.runner === 'google' ? 'steps' : 'turns'} so far`);
+        try {
+          t.lastOutput = fs.statSync(path.join(t.dir, 'log.jsonl')).mtimeMs; // idle counts from the log, not the restart
+        } catch {
+          /* no log yet */
+        }
+        this.armWatchers(t, t.started + t.minutes * 60_000 - Date.now());
+        this.watch(t);
+      } else {
+        log(`agent task ${t.id}: re-attached after a restart — it finished while the window was away`);
+        void this.finish(t, null);
+      }
+      this.save(t);
+    }
+    await this.promote();
+  }
+
+  /**
+   * Feeds the whole saved log through the event handlers (render and kill held
+   * back) so turns, tool uses, written files, the report and tokens are right
+   * again, and returns the log's size in bytes — the tailer starts there.
+   */
+  private replay(t: Task): number {
+    let text = '';
+    try {
+      text = fs.readFileSync(path.join(t.dir, 'log.jsonl'), 'utf-8');
+    } catch {
+      /* no log yet */
+    }
+    this.replaying++;
+    try {
+      for (const line of text.split('\n')) {
+        if (line.trim()) this.onLine(t, line);
+      }
+      if (t.killPending && t.pid && sessionPids(t.pid).length > 0) {
+        t.killPending = undefined;
+        this.kill(t); // the run passed a limit while no host was watching
+      } else {
+        t.killPending = undefined;
+      }
+    } finally {
+      this.replaying--;
+    }
+    return Buffer.byteLength(text, 'utf-8');
+  }
+
+  /** Task folders (patch + log) older than KEEP_DAYS go, with any worktree they still hold. */
   private prune(): void {
     try {
       for (const name of fs.readdirSync(this.root())) {
         const dir = path.join(this.root(), name);
-        if (Date.now() - fs.statSync(dir).mtimeMs > KEEP_DAYS * 86_400_000) fs.rmSync(dir, { recursive: true, force: true });
+        if (Date.now() - fs.statSync(dir).mtimeMs > KEEP_DAYS * 86_400_000) {
+          // A worktree the old dispose() would have removed: take it out of the
+          // user's repo before the task dir that names it disappears.
+          const j = this.readState(dir);
+          const worktree = path.join(dir, 'worktree');
+          const repo = typeof j?.repo === 'string' ? j.repo : undefined;
+          if (fs.existsSync(worktree) && repo) {
+            try {
+              execFileSync('git', ['-C', repo, 'worktree', 'remove', '--force', worktree], { stdio: 'ignore', timeout: 60_000 });
+            } catch {
+              /* best effort — `git worktree prune` will settle the rest */
+            }
+          }
+          fs.rmSync(dir, { recursive: true, force: true });
+        }
       }
     } catch {
       /* nothing yet */
@@ -400,6 +660,7 @@ export class AgentTasks implements vscode.Disposable {
   }
 
   private render(): void {
+    if (this.replaying > 0) return; // a replayed log paints no intermediate states
     this.onDidChange.fire();
   }
 
@@ -438,6 +699,30 @@ export class AgentTasks implements vscode.Disposable {
     return [...this.tasks.values()]
       .sort((a, b) => b.started - a.started)
       .map((t) => ({ id: t.id, worker: t.worker, status: t.status, task: t.task, started: t.started, files: t.files?.length ?? 0, applied: Boolean(t.applied) }));
+  }
+
+  /**
+   * list_tasks: this window's tasks on at most 30 lines — running/queued first
+   * (oldest first), then finished newest first — so a lead that lost track of
+   * its tasks (a host restart, a reset of its context) finds them again.
+   */
+  listText(filter?: string): string {
+    const all = [...this.tasks.values()].sort((a, b) => a.started - b.started);
+    const rows = [
+      ...all.filter((t) => t.status === 'running' || t.status === 'queued'),
+      ...all.filter((t) => t.status !== 'running' && t.status !== 'queued').sort((a, b) => b.started - a.started),
+    ]
+      .filter((t) => !filter || t.status === filter)
+      .slice(0, 30)
+      .map((t) => {
+        const steps = t.runner === 'codex' || t.runner === 'google' ? 'steps' : 'turns';
+        const ago = Math.max(0, Math.round((Date.now() - t.started) / 60_000));
+        const ended = t.status !== 'running' && t.status !== 'queued';
+        const applied = ended && t.files?.length ? (t.applied ? ' · applied' : ' · not applied') : '';
+        return `${t.id} · ${t.worker} · ${t.status} · started ${ago} min ago · ${t.turns} ${steps} · ${t.files?.length ?? 0} files${applied} — "${t.task.slice(0, 80).replace(/\s+/g, ' ')}"`;
+      });
+    if (!rows.length) return filter ? `No ${filter} tasks in this window.` : 'No tasks in this window yet — start_task begins one.';
+    return rows.join('\n') + '\n(running: call wait_task; finished and not applied: review with wait_task, then apply_task_changes)';
   }
 
   /** A task's run as a readable Markdown transcript, from its log; undefined for an unknown task. */
@@ -716,7 +1001,7 @@ export class AgentTasks implements vscode.Disposable {
     let pred: Task | undefined;
     if (after) {
       pred = this.tasks.get(after);
-      if (!pred) throw new Error(`No task ${after} in this window.`);
+      if (!pred) throw new Error(this.unknownId(after));
       if ((pred.status === 'failed' || pred.status === 'cancelled') && !pred.result) throw new Error(`Task ${after} ${pred.status} before it changed anything — nothing to build on.`);
     }
     const id = `t${Date.now().toString(36)}${crypto.randomBytes(2).toString('hex')}`;
@@ -724,7 +1009,7 @@ export class AgentTasks implements vscode.Disposable {
     fs.mkdirSync(path.join(dir, 'config'), { recursive: true, mode: 0o700 });
     const repo = pred ? pred.repo : await this.repoRoot();
     const t: Task = {
-      id, worker, task, context, after, status: 'queued', dir, repo, base: '', worktree: path.join(dir, 'worktree'),
+      id, owner: this.owner, worker, task, context, after, status: 'queued', dir, repo, base: '', worktree: path.join(dir, 'worktree'),
       started: Date.now(), turns: 0, toolUses: 0, written: new Set(), waiters: [],
       minutes: bound(opts.minutes, TASK_LIMITS.minutes), maxTurns: bound(opts.maxTurns, TASK_LIMITS.turns),
       role: opts.role, effort: opts.effort,
@@ -754,6 +1039,7 @@ export class AgentTasks implements vscode.Disposable {
       t.snapshotNote = pred.snapshotNote;
     }
     this.tasks.set(id, t);
+    this.save(t);
     log(`agent task ${id}: queued on ${worker}${after ? ` after ${after}` : ''}`);
     await this.promote();
     return { id, queued: t.status === 'queued', note: notes.length ? notes.join(' ') : undefined };
@@ -768,6 +1054,7 @@ export class AgentTasks implements vscode.Disposable {
         t.status = 'failed';
         t.error = `its predecessor ${pred.id} ${pred.status}`;
         t.ended = Date.now();
+        this.save(t);
         for (const w of t.waiters.splice(0)) w();
         continue;
       }
@@ -781,6 +1068,7 @@ export class AgentTasks implements vscode.Disposable {
         t.status = 'failed';
         t.error = (err as Error).message;
         t.ended = Date.now();
+        this.save(t);
         log(`agent task ${t.id}: could not start — ${t.error}`);
         for (const w of t.waiters.splice(0)) w();
       }
@@ -811,6 +1099,9 @@ export class AgentTasks implements vscode.Disposable {
     t.runner = spec.runner === 'google' && spec.google ? 'google' : spec.runner === 'codex' && spec.codex ? 'codex' : 'claude';
     t.model = spec.runModel;
     // Workers can consult: the workers server with the restricted token (delegate, list_workers, provider_usage).
+    // Known limitation, accepted: a run re-adopted after a host restart may hold a consult connection whose
+    // URL/token (baked into its run config) belonged to the OLD host's server — the new host's server has a new
+    // port and token. Consults then fail inside the agent and it carries on; the lead replaces that separately.
     let access = this.access?.();
     if (t.runner === 'google') {
       const mcp = access ? writeAgyMcpConfig(t.worktree, access.url, access.token).created : false;
@@ -855,47 +1146,140 @@ export class AgentTasks implements vscode.Disposable {
         : '') +
       `\n\n<task>\n${local(t.task)}\n</task>` +
       (t.context ? `\n\n<context>\n${local(t.context)}\n</context>` : '');
-    const child = t.runner === 'google' ? await this.spawnGoogle(t, spec.google!, spec.runModel, prompt) : t.runner === 'codex' ? this.spawnCodex(t, spec.codex!, spec.runModel, prompt, access) : this.spawnClaude(t, spec, prompt, access, config);
-    t.child = child;
-    const out = fs.openSync(path.join(t.dir, 'log.jsonl'), 'a', 0o600);
-    let buf = '';
+    // The run is detached (its own session) with its stream going straight into
+    // log.jsonl — no pipe that a host exit would break — and wrapped in a hard
+    // wall (proc.ts LIMIT_SNIPPET) so it ends at its limit even with no host
+    // watching. This host then only TAILS the log.
+    const logFd = fs.openSync(path.join(t.dir, 'log.jsonl'), 'a', 0o600);
     t.lastOutput = Date.now();
-    child.stdout!.on('data', (d: Buffer) => {
-      t.lastOutput = Date.now();
-      fs.writeSync(out, d);
-      buf += d.toString();
-      let nl: number;
-      while ((nl = buf.indexOf('\n')) >= 0) {
-        if (t.runner === 'google') this.onGoogleEvent(t, buf.slice(0, nl));
-        else if (t.runner === 'codex') this.onCodexEvent(t, buf.slice(0, nl));
-        else this.onEvent(t, buf.slice(0, nl));
-        buf = buf.slice(nl + 1);
-      }
+    let child: ChildProcess;
+    try {
+      child =
+        t.runner === 'google' ? await this.spawnGoogle(t, spec.google!, spec.runModel, prompt, logFd) :
+        t.runner === 'codex' ? this.spawnCodex(t, spec.codex!, spec.runModel, prompt, access, logFd) :
+        this.spawnClaude(t, spec, prompt, access, config, logFd);
+    } catch (err) {
+      fs.closeSync(logFd);
+      throw err;
+    }
+    fs.closeSync(logFd); // the child holds its own duplicates
+    t.child = child;
+    t.pid = child.pid;
+    t.supervisor = process.pid;
+    child.unref(); // the run must outlive this host
+    child.on('error', (err) => {
+      t.error = err.message;
+      this.save(t);
     });
-    child.stderr!.on('data', (d: Buffer) => fs.writeSync(out, d));
-    const wall = setTimeout(() => {
-      t.error = `stopped at its ${t.minutes}-minute limit`;
-      this.kill(t);
-    }, t.minutes * 60_000);
-    const idle = setInterval(() => {
-      if (Date.now() - (t.lastOutput ?? 0) < IDLE_MS) return;
-      t.error = `stopped: no output for ${IDLE_MS / 60_000} minutes`;
-      this.kill(t);
-    }, 60_000);
-    child.on('error', (err) => { t.error = err.message; });
     child.on('close', (code) => {
-      if (t.runner === 'google' && buf.trim()) this.onGoogleEvent(t, buf);
-      clearTimeout(wall);
-      clearInterval(idle);
-      fs.closeSync(out);
+      this.pumpFinal(t);
+      this.stopWatchers(t);
       void this.finish(t, code);
     });
+    t.tail = { fd: fs.openSync(path.join(t.dir, 'log.jsonl'), 'r'), offset: 0, buf: '' };
+    this.armWatchers(t, t.minutes * 60_000);
+    this.watch(t);
+    this.save(t);
     log(`agent task ${t.id}: started on ${t.worker} (${t.runner === 'google' ? 'Google AI (Antigravity, edit-only)' : t.runner === 'codex' ? 'Codex' : 'Claude Code'}, ${spec.runModel}) in ${t.worktree}`);
     this.render();
   }
 
-  /** Claude Code on the worker's provider: its own config dir, auto mode, stream-json. */
-  private spawnClaude(t: Task, spec: AgentRunSpec, prompt: string, access: { url: string; token: string } | undefined, config: string): ChildProcess {
+  /** The wall clock and the idle watcher. `remainMs <= 0` — a re-adopted task already past its limit — ends the run now. */
+  private armWatchers(t: Task, remainMs: number): void {
+    if (remainMs <= 0) {
+      t.error ??= `stopped at its ${t.minutes}-minute limit`;
+      this.save(t);
+      this.kill(t);
+      return;
+    }
+    t.wall = setTimeout(() => {
+      t.error ??= `stopped at its ${t.minutes}-minute limit`;
+      this.save(t);
+      this.kill(t);
+    }, remainMs);
+    t.idle = setInterval(() => {
+      if (Date.now() - (t.lastOutput ?? t.started) < IDLE_MS) return;
+      t.error ??= `stopped: no output for ${IDLE_MS / 60_000} minutes`;
+      this.save(t);
+      this.kill(t);
+    }, 60_000);
+  }
+
+  /** The log tailer (500 ms) and, for a run this host didn't spawn, the liveness poll (1 s). */
+  private watch(t: Task): void {
+    if (!t.tail) return;
+    t.tail.timer ??= setInterval(() => this.pump(t), 500);
+    if (!t.child && t.pid) {
+      t.poll ??= setInterval(() => {
+        if (sessionPids(t.pid!).length > 0) return;
+        this.pumpFinal(t);
+        this.stopWatchers(t);
+        void this.finish(t, null); // how it ended is in the log, not an exit code
+      }, 1000);
+    }
+  }
+
+  /** Reads whatever new bytes landed in log.jsonl and feeds complete lines to the event handlers. */
+  private pump(t: Task): void {
+    const tail = t.tail;
+    if (!tail) return;
+    let size = 0;
+    try {
+      size = fs.fstatSync(tail.fd).size;
+    } catch {
+      return;
+    }
+    if (size <= tail.offset) return;
+    const fresh = Buffer.alloc(size - tail.offset);
+    try {
+      fs.readSync(tail.fd, fresh, 0, fresh.length, tail.offset);
+    } catch {
+      return;
+    }
+    tail.offset += fresh.length;
+    t.lastOutput = Date.now();
+    tail.buf += fresh.toString();
+    let nl: number;
+    while ((nl = tail.buf.indexOf('\n')) >= 0) {
+      this.onLine(t, tail.buf.slice(0, nl));
+      tail.buf = tail.buf.slice(nl + 1);
+    }
+    this.save(t); // counters, report and errors trail the log by at most one poll
+  }
+
+  /** The last pump, then a trailing line without its newline. */
+  private pumpFinal(t: Task): void {
+    this.pump(t);
+    if (t.tail?.buf.trim()) this.onLine(t, t.tail.buf);
+    if (t.tail) t.tail.buf = '';
+  }
+
+  private onLine(t: Task, line: string): void {
+    if (t.runner === 'google') this.onGoogleEvent(t, line);
+    else if (t.runner === 'codex') this.onCodexEvent(t, line);
+    else this.onEvent(t, line);
+  }
+
+  private stopWatchers(t: Task): void {
+    if (t.wall) clearTimeout(t.wall);
+    t.wall = undefined;
+    if (t.idle) clearInterval(t.idle);
+    t.idle = undefined;
+    if (t.tail?.timer) clearInterval(t.tail.timer);
+    if (t.tail) {
+      try {
+        fs.closeSync(t.tail.fd);
+      } catch {
+        /* already closed */
+      }
+      t.tail = undefined;
+    }
+    if (t.poll) clearInterval(t.poll);
+    t.poll = undefined;
+  }
+
+  /** Claude Code on the worker's provider: its own config dir, auto mode, stream-json. Detached, into log.jsonl. */
+  private spawnClaude(t: Task, spec: AgentRunSpec, prompt: string, access: { url: string; token: string } | undefined, config: string, logFd: number): ChildProcess {
     const args = [
       '-p', prompt, '--model', spec.runModel, '--permission-mode', 'auto',
       ...(t.effort ? ['--effort', t.effort] : []),
@@ -906,12 +1290,13 @@ export class AgentTasks implements vscode.Disposable {
     // Only the run's own config and provider: none of this window's account or provider leaks in.
     const env: NodeJS.ProcessEnv = { ...process.env };
     for (const k of Object.keys(env)) if (k.startsWith('ANTHROPIC_') || k === 'CLAUDE_CONFIG_DIR') delete env[k];
-    Object.assign(env, spec.secretEnv, { CLAUDE_CONFIG_DIR: config, PYTHONDONTWRITEBYTECODE: '1' });
+    Object.assign(env, spec.secretEnv, { CLAUDE_CONFIG_DIR: config, PYTHONDONTWRITEBYTECODE: '1', CPPO_LIMIT_S: String(t.minutes * 60 + 120) });
     // The Claude Code extension's binary, through a login shell (see cli.ts).
-    return spawn(process.env.SHELL || '/bin/bash', claudeShellArgs(args), {
+    return spawn(process.env.SHELL || '/bin/bash', claudeShellArgs(args, t.minutes * 60 + 120), {
       cwd: t.worktree,
       env,
-      stdio: ['ignore', 'pipe', 'pipe'],
+      detached: true,
+      stdio: ['ignore', logFd, logFd],
     });
   }
 
@@ -920,9 +1305,11 @@ export class AgentTasks implements vscode.Disposable {
    * to writing there (no network for commands), approval requests reviewed
    * automatically, the user's Codex config and rules not loaded (its sign-in
    * still is), nothing kept on disk. The workers server comes in as an MCP server
-   * with the restricted token, from the environment. Prompt on stdin.
+   * with the restricted token, from the environment. The prompt — on stdin
+   * before, which would tie the run to this host — goes in through
+   * <dir>/prompt.txt, deleted once the run ends. Detached, into log.jsonl.
    */
-  private spawnCodex(t: Task, ctx: CodexContext, model: string, prompt: string, access: { url: string; token: string } | undefined): ChildProcess {
+  private spawnCodex(t: Task, ctx: CodexContext, model: string, prompt: string, access: { url: string; token: string } | undefined, logFd: number): ChildProcess {
     const mcp = `mcp_servers.${CONSULT_SERVER}`;
     const args = [
       'exec', '--json', '--ephemeral', '--ignore-user-config', '--ignore-rules',
@@ -937,23 +1324,32 @@ export class AgentTasks implements vscode.Disposable {
     ];
     const env: NodeJS.ProcessEnv = { ...process.env };
     for (const k of Object.keys(env)) if (k.startsWith('ANTHROPIC_') || k === 'CLAUDE_CONFIG_DIR' || k === 'OPENAI_API_KEY' || k === 'CODEX_API_KEY') delete env[k];
-    Object.assign(env, ctx.env, { CODEX_HOME: ctx.home, PYTHONDONTWRITEBYTECODE: '1' }, access ? { CPPO_WORKERS_TOKEN: access.token } : {});
-    const child = spawn(process.env.SHELL || '/bin/bash', codexShellArgs(ctx.bin, args), { cwd: t.worktree, env, stdio: ['pipe', 'pipe', 'pipe'] });
-    child.stdin!.end(prompt);
-    return child;
+    Object.assign(env, ctx.env, { CODEX_HOME: ctx.home, PYTHONDONTWRITEBYTECODE: '1', CPPO_LIMIT_S: String(t.minutes * 60 + 120) }, access ? { CPPO_WORKERS_TOKEN: access.token } : {});
+    const promptFile = path.join(t.dir, 'prompt.txt');
+    fs.writeFileSync(promptFile, prompt, { mode: 0o600 });
+    const inFd = fs.openSync(promptFile, 'r');
+    try {
+      return spawn(process.env.SHELL || '/bin/bash', codexShellArgs(ctx.bin, args, t.minutes * 60 + 120), { cwd: t.worktree, env, detached: true, stdio: [inFd, logFd, logFd] });
+    } finally {
+      fs.closeSync(inFd); // the child holds its own duplicate
+    }
   }
 
-  /** agy edits workspace files only; shell and URL actions are always refused. */
-  private async spawnGoogle(t: Task, google: NonNullable<AgentRunSpec['google']>, modelId: string, prompt: string): Promise<ChildProcess> {
+  /**
+   * agy edits workspace files only; shell and URL actions are always refused.
+   * Through the same /bin/sh limit trampoline as the other runners, detached,
+   * into log.jsonl.
+   */
+  private async spawnGoogle(t: Task, google: NonNullable<AgentRunSpec['google']>, modelId: string, prompt: string, logFd: number): Promise<ChildProcess> {
     const model = google.models.find((m) => m.id === modelId);
     if (!model) throw new Error(`Google AI model ${modelId} isn't available`);
-    const env = await agyRunEnv(google.ctx, {});
+    const env = await agyRunEnv(google.ctx, { CPPO_LIMIT_S: String(t.minutes * 60 + 120) });
     const files = agyPromptArgs(prompt);
     try {
-      const child = spawn(google.ctx.bin, agyAgentArgs({
+      const child = spawn('/bin/sh', ['-c', LIMIT_SNIPPET, google.ctx.bin, ...agyAgentArgs({
         slug: agySlug(model, t.effort), settings: agyPermissions(t.google?.mcp ? { mcpServer: CONSULT_SERVER } : undefined),
         promptArgs: files.args, timeoutSec: t.minutes * 60,
-      }), { cwd: t.worktree, env, detached: true, stdio: ['ignore', 'pipe', 'pipe'] });
+      })], { cwd: t.worktree, env, detached: true, stdio: ['ignore', logFd, logFd] });
       child.on('close', () => files.cleanup());
       return child;
     } catch (err) {
@@ -1003,6 +1399,7 @@ export class AgentTasks implements vscode.Disposable {
     if (ev.event === 'result') {
       const result = ev.result ?? ev;
       t.googleResult = true;
+      t.sawResult = true;
       t.report = result.response;
       t.inTok = result.usage?.input_tokens;
       t.outTok = result.usage ? (result.usage.output_tokens ?? 0) + (result.usage.thinking_tokens ?? 0) : undefined;
@@ -1046,6 +1443,7 @@ export class AgentTasks implements vscode.Disposable {
       }
       this.render();
     } else if (ev.type === 'turn.completed') {
+      t.sawResult = true;
       t.inTok = (t.inTok ?? 0) + (ev.usage?.input_tokens ?? 0);
       t.outTok = (t.outTok ?? 0) + (ev.usage?.output_tokens ?? 0) + (ev.usage?.reasoning_output_tokens ?? 0);
       t.report = t.lastText;
@@ -1090,6 +1488,7 @@ export class AgentTasks implements vscode.Disposable {
       }
       this.render();
     } else if (ev.type === 'result') {
+      t.sawResult = true;
       t.report = ev.result;
       t.costUsd = ev.total_cost_usd;
       t.inTok = ev.usage?.input_tokens;
@@ -1100,6 +1499,8 @@ export class AgentTasks implements vscode.Disposable {
   }
 
   private async finish(t: Task, code: number | null): Promise<void> {
+    this.stopWatchers(t);
+    fs.rmSync(path.join(t.dir, 'prompt.txt'), { force: true }); // the run's prompt (Codex stdin), no longer needed
     // The dependency links go first: they're the user's folders, never the task's changes.
     for (const name of t.links ?? []) {
       try {
@@ -1112,6 +1513,8 @@ export class AgentTasks implements vscode.Disposable {
     try {
       if (t.runner === 'google') {
         if (t.google?.mcp) removeAgyMcpConfig(t.worktree);
+        // `code === null` means this host never saw the process end (a re-adopted
+        // run): success is then decided by the log's own terminal event below.
         if (code === 0 && !t.googleResult && !t.error) t.error = 'Google AI ended without a result';
         if (t.role === '2d-art' && t.google && t.conversationId) {
           const copied: string[] = [];
@@ -1178,28 +1581,40 @@ export class AgentTasks implements vscode.Disposable {
     }
     fs.rmSync(path.join(t.dir, 'config'), { recursive: true, force: true }); // the run's settings
     fs.rmSync(path.join(t.dir, 'index'), { force: true });
-    if (t.status === 'running') t.status = t.cancelling ? 'cancelled' : t.error || (code !== 0 && !t.report) ? 'failed' : 'done';
+    // With no exit code of our own (this host re-adopted the run), the log decides:
+    // the runner's own terminal event, or at least a report, counts as success.
+    if (code === null && !t.error && !t.report && !t.sawResult) t.error = 'the run ended without reporting';
+    if (t.status === 'running') {
+      const ok = !t.error && (code === 0 || Boolean(t.report) || (code === null && t.sawResult));
+      t.status = t.cancelling ? 'cancelled' : ok ? 'done' : 'failed';
+    }
     t.ended = Date.now();
     t.child = undefined;
-    log(`agent task ${t.id}: ${t.status} in ${Math.round((t.ended - t.started) / 1000)} s, ${t.turns} ${t.runner === 'codex' || t.runner === 'google' ? 'steps' : 'turns'}, ${t.files?.length ?? 0} files changed`);
+    log(`agent task ${t.id}: ${t.status}${t.error && t.status !== 'done' ? ` (${t.error})` : ''} in ${Math.round((t.ended - t.started) / 1000)} s, ${t.turns} ${t.runner === 'codex' || t.runner === 'google' ? 'steps' : 'turns'}, ${t.files?.length ?? 0} files changed`);
+    this.save(t);
     this.onTaskDone?.(t.worker, t.inTok ?? 0, t.outTok ?? 0);
     this.render();
     for (const w of t.waiters.splice(0)) w();
     await this.promote(); // a slot is free, and tasks chained on this one may start
   }
 
+  /**
+   * Ends a run: SIGTERM to every process in its session, then SIGKILL five
+   * seconds later if any survived (a tool may trap TERM). The session — not the
+   * leader's process group — because `timeout` moves the runner to a group of
+   * its own and a shell command may spawn further groups or sessions.
+   */
   private kill(t: Task): void {
-    const c = t.child;
-    if (!c?.pid) return;
-    if (t.runner === 'google') {
-      const pid = c.pid;
-      const signal = (sig: NodeJS.Signals) => { try { process.kill(-pid, sig); } catch { /* already gone */ } };
-      signal('SIGTERM');
-      setTimeout(() => signal('SIGKILL'), 5000);
-    } else {
-      c.kill('SIGTERM');
-      setTimeout(() => c.exitCode === null && c.kill('SIGKILL'), 5000);
+    if (this.replaying > 0) {
+      t.killPending = true; // the log is history, not now; act on it after the replay
+      return;
     }
+    const pid = t.pid ?? t.child?.pid;
+    if (!pid) return;
+    killSession(pid, 'SIGTERM');
+    setTimeout(() => {
+      if (sessionPids(pid).length > 0) killSession(pid, 'SIGKILL');
+    }, 5000);
   }
 
   cancel(id: string): string {
@@ -1208,6 +1623,7 @@ export class AgentTasks implements vscode.Disposable {
     if (t.status === 'queued') {
       t.status = 'cancelled';
       t.ended = Date.now();
+      this.save(t);
       for (const w of t.waiters.splice(0)) w();
       void this.promote(); // tasks chained on it fail now
       return `Cancelled ${id} before it started.`;
@@ -1216,14 +1632,29 @@ export class AgentTasks implements vscode.Disposable {
     // Stays "running" until finish() has collected the changes, so wait_task waits for them.
     t.cancelling = true;
     t.error ??= 'stopped by the lead';
+    this.save(t);
     this.kill(t);
     return `Cancelling ${id}; its changes so far are still collected.`;
+  }
+
+  /** Why an unknown id is unknown — and where to look instead. */
+  private unknownId(id: string): string {
+    const dir = path.join(this.root(), id);
+    if (fs.existsSync(dir)) {
+      const j = this.readState(dir);
+      if (j) {
+        if (typeof j.owner === 'string' && j.owner !== this.owner) return `Task ${id} belongs to another VS Code window. Call list_tasks for this window's tasks.`;
+      } else {
+        return `Task ${id} was started by an older CPPO and lost when its window restarted (its log is in ${dir}). Call list_tasks for this window's tasks.`;
+      }
+    }
+    return `Task ${id} isn't known to this window (it may be from another window, or older than ${KEEP_DAYS} days). Call list_tasks for this window's tasks.`;
   }
 
   /** Waits up to `seconds` for the task to end; then reports where it is. */
   async wait(id: string, seconds: number): Promise<{ text: string; isError?: boolean }> {
     const t = this.tasks.get(id);
-    if (!t) return { text: `No task ${id} in this window.`, isError: true };
+    if (!t) return { text: this.unknownId(id), isError: true };
     if (t.status === 'running' || t.status === 'queued') {
       await new Promise<void>((resolve) => {
         // At most 240 s: the whole MCP call must end inside Claude Code's 5-minute idle limit.
@@ -1291,7 +1722,7 @@ export class AgentTasks implements vscode.Disposable {
    */
   async apply(id: string): Promise<{ text: string; isError?: boolean }> {
     const t = this.tasks.get(id);
-    if (!t) return { text: `No task ${id} in this window.`, isError: true };
+    if (!t) return { text: this.unknownId(id), isError: true };
     if (t.status === 'running' || t.status === 'queued') return { text: `Task ${id} is ${t.status}; wait for it to end first.`, isError: true };
     if (!t.result) return { text: `Task ${id} ${t.status} before it changed anything.`, isError: true };
     if (t.applied) return { text: `Task ${id} was already applied.`, isError: true };
@@ -1304,7 +1735,10 @@ export class AgentTasks implements vscode.Disposable {
     const from = lastApplied >= 0 ? chain[lastApplied].result! : chain[0].base;
     const patch = await git(t.repo, ['diff', '--binary', from, t.result!]);
     if (!patch.trim()) {
-      pending.forEach((x) => (x.applied = true));
+      pending.forEach((x) => {
+        x.applied = true;
+        this.save(x);
+      });
       return { text: `Nothing to apply: ${pending.map((x) => x.id).join(', ')} changed no files.` };
     }
     const file = path.join(t.dir, pending.length > 1 ? 'chain.patch' : 'apply.patch');
@@ -1318,7 +1752,10 @@ export class AgentTasks implements vscode.Disposable {
       };
     }
     await git(t.repo, ['apply', '--whitespace=nowarn', file]);
-    pending.forEach((x) => (x.applied = true));
+    pending.forEach((x) => {
+      x.applied = true;
+      this.save(x);
+    });
     const files = (await git(t.repo, ['diff', '--name-only', from, t.result!])).trim().split('\n').filter(Boolean);
     log(`agent task ${id}: applied to ${t.repo} (${pending.map((x) => x.id).join(' → ')}, ${files.length} files)`);
     return {
@@ -1361,25 +1798,17 @@ export class AgentTasks implements vscode.Disposable {
   }
 
   dispose(): void {
-    // The window is going away mid-task: stop the run and take its worktree out
-    // of the user's repo now — nothing will be left to collect it later.
+    // The window is going away — its running tasks are NOT stopped. Each run is
+    // detached with a hard wall of its own and its state is on disk: the next
+    // host of this window re-adopts it (or collects its finished result), and
+    // the lead can still wait_task/apply_task_changes it by id. Killing here is
+    // exactly what used to throw an hour of work away on every reload.
     for (const t of this.tasks.values()) {
-      if (t.status !== 'running') continue;
-      if (t.runner === 'google' && t.child?.pid) {
-        try { process.kill(-t.child.pid, 'SIGKILL'); } catch { /* already gone */ }
-      } else t.child?.kill('SIGKILL');
-      if (t.google?.mcp) removeAgyMcpConfig(t.worktree);
-      for (const name of t.links ?? []) {
-        try {
-          fs.unlinkSync(path.join(t.worktree, name)); // the user's own folders: unlink, never recurse
-        } catch {
-          /* gone */
-        }
-      }
-      try {
-        execFileSync('git', ['worktree', 'remove', '--force', t.worktree], { cwd: t.repo, stdio: 'ignore' });
-      } catch {
-        /* best effort */
+      this.stopWatchers(t);
+      if (t.status === 'running' || t.status === 'queued') {
+        t.supervisor = undefined; // no one is managing it until a host takes over
+        t.child = undefined;
+        this.save(t);
       }
     }
     this.onDidChange.dispose();

@@ -2,7 +2,7 @@
   "name": "cppo",
   "displayName": "CPPO — Claude Parallel Profile Orchestration",
   "description": "Make Claude Code the lead of a multi-model team. The Claude in your chat hands focused questions and real, sandboxed coding work to the other models you use — GLM on Z.ai, GPT through OpenAI Codex, Gemini through Google AI, Claude on your own plan — routes each kind of work by rules you set once, and reviews every change before it reaches your code. Underneath: a different Claude account in each VS Code window, with one shared conversation history.",
-  "version": "1.20.0",
+  "version": "1.21.0",
   "publisher": "BeboutItSolutions",
   "icon": "images/icon.png",
   "repository": {

@@ -4,6 +4,7 @@ import * as path from 'path';
 import { execFile } from 'child_process';
 import { log } from './log';
 import { readIdentity } from './accounts';
+import { LIMIT_SNIPPET } from './proc';
 
 /**
  * Thin wrapper around the `claude` CLI's auth commands, scoped to a specific
@@ -44,10 +45,16 @@ export function bundledClaude(): string | undefined {
  * Shell arguments that run Claude Code with `args`: the extension's binary when
  * there is one, else `claude` from PATH. Through a login shell either way, so
  * the commands an agent runs see the user's PATH (nvm and the like).
+ *
+ * With `limitSec`, the trampoline instead wraps the run in `timeout` (proc.ts
+ * LIMIT_SNIPPET): a detached agent task gets a hard wall that ends it even if
+ * the extension host that started it is gone. The caller must set CPPO_LIMIT_S
+ * in the environment. Other callers (consultations) keep the plain exec.
  */
-export function claudeShellArgs(args: string[]): string[] {
+export function claudeShellArgs(args: string[], limitSec?: number): string[] {
   const bin = bundledClaude();
-  return bin ? ['-lc', 'exec "$0" "$@"', bin, ...args] : ['-lc', 'exec claude "$@"', 'claude', ...args];
+  if (limitSec === undefined) return bin ? ['-lc', 'exec "$0" "$@"', bin, ...args] : ['-lc', 'exec claude "$@"', 'claude', ...args];
+  return bin ? ['-lc', LIMIT_SNIPPET, bin, ...args] : ['-lc', LIMIT_SNIPPET, 'claude', ...args];
 }
 
 /** Runs a claude CLI command through a login shell so nvm/PATH resolve. */

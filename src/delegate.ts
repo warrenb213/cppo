@@ -268,10 +268,10 @@ const KEEP_CONSULTS = 50;
 export class DelegateServer implements vscode.Disposable {
   private server: http.Server | undefined;
   private port = 0;
-  /** The lead's token: every tool. */
-  private readonly token = crypto.randomBytes(24).toString('hex');
+  /** The lead's token: every tool. Stable across restarts of this window's extension host (endpoint files). */
+  private token = crypto.randomBytes(24).toString('hex');
   /** Agent runs' token: consult and usage only — a worker can't start tasks. */
-  private readonly workerToken = crypto.randomBytes(24).toString('hex');
+  private workerToken = crypto.randomBytes(24).toString('hex');
   private calls = 0;
   private readonly stopBlocks = new Map<string, number>();
   readonly usage = new UsageBook();
@@ -301,7 +301,7 @@ export class DelegateServer implements vscode.Disposable {
     try {
       if (want) {
         const wasUp = Boolean(this.server);
-        await this.start();
+        await this.start(dir);
         if (wasUp) this.notifyToolsChanged();
         register(dir!, {
           type: 'http',
@@ -322,19 +322,43 @@ export class DelegateServer implements vscode.Disposable {
     }
   }
 
-  private start(): Promise<void> {
-    if (this.server) return Promise.resolve();
-    const server = http.createServer((req, res) => void this.handle(req, res));
-    this.server = server;
-    return new Promise((resolve, reject) => {
-      server.once('error', reject);
-      server.listen(0, '127.0.0.1', () => {
-        this.port = (server.address() as { port: number }).port;
-        this.lastTools = JSON.stringify([this.tools(true), this.tools(false)]);
-        log(`workers: MCP server on 127.0.0.1:${this.port} (${this.source.workers().map((w) => w.id).join(', ')})`);
-        resolve();
+  /**
+   * Starts listening. The port and both tokens are kept in this window's config
+   * dir and reused after the extension host restarts (a reload, an SSH
+   * reconnect, a crash): a Claude Code session that was already running then
+   * finds the server where it left it, and agent runs that survived the restart
+   * can still consult. A taken port falls back to a new one (the registration
+   * in .claude.json then changes; the tokens stay).
+   */
+  private async start(dir?: string): Promise<void> {
+    if (this.server) return;
+    const saved = dir ? readEndpoint(dir) : undefined;
+    if (saved) {
+      this.token = saved.token;
+      this.workerToken = saved.workerToken;
+    }
+    const listen = (port: number) =>
+      new Promise<http.Server>((resolve, reject) => {
+        const server = http.createServer((req, res) => void this.handle(req, res));
+        server.once('error', reject);
+        server.listen(port, '127.0.0.1', () => {
+          server.off('error', reject);
+          resolve(server);
+        });
       });
-    });
+    let server: http.Server;
+    try {
+      server = await listen(saved?.port ?? 0);
+    } catch (err) {
+      if (!saved) throw err;
+      log(`workers: port ${saved.port} is taken (${(err as Error).message}) — using a new one`);
+      server = await listen(0);
+    }
+    this.server = server;
+    this.port = (server.address() as { port: number }).port;
+    if (dir) saveEndpoint(dir, { port: this.port, token: this.token, workerToken: this.workerToken });
+    this.lastTools = JSON.stringify([this.tools(true), this.tools(false)]);
+    log(`workers: MCP server on 127.0.0.1:${this.port}${saved?.port === this.port ? ' (same as before the restart)' : ''} (${this.source.workers().map((w) => w.id).join(', ')})`);
   }
 
   private stop(): void {
@@ -405,7 +429,8 @@ export class DelegateServer implements vscode.Disposable {
             'diff via wait_task; review it before apply_task_changes. Ask by `role` (list_roles: quick, ' +
             'second-opinion, review, hard-reasoning, implement, test-and-fix, vector-art, 2d-art) so the user\'s ' +
             'choice of model, effort and fallbacks applies. Check workers\' output before relying on it. ' +
-            "After start_task, keep working: call wait_task (it waits up to 4 minutes) until every task you started is done, then review each diff and apply or report it; don't end your turn while tasks you started are still running.",
+            "After start_task, keep working: call wait_task (it waits up to 4 minutes) until every task you started is done, then review each diff and apply or report it; don't end your turn while tasks you started are still running. " +
+            'If you lose track of a task — after a restart or a reset of your context — call list_tasks.',
         });
       case 'ping':
         return reply({});
@@ -506,7 +531,8 @@ export class DelegateServer implements vscode.Disposable {
           "(e.g. Claude on the user's subscription). Returns a task_id at once; tasks take minutes. The worker " +
           'sees only its copy and what you put in task/context: gitignored files (scratch folders, build output) ' +
           'are not in it unless listed in `include` — or named in task/context by absolute path, which copies ' +
-          "that file in. Keep calling wait_task until it is done, then review the diff and apply or report it; don't end your turn while it runs.",
+          "that file in. Keep calling wait_task until it is done, then review the diff and apply or report it; don't end your turn while it runs. " +
+          'If you lose track of a task — after a restart or a reset of your context — call list_tasks.',
         inputSchema: {
           type: 'object',
           properties: {
@@ -563,6 +589,17 @@ export class DelegateServer implements vscode.Disposable {
         inputSchema: { type: 'object', properties: { task_id: id }, required: ['task_id'] },
       },
       {
+        name: 'list_tasks',
+        description:
+          "This window's agent tasks, one line each (running and queued first, then finished newest first): id, worker, status, " +
+          'age, steps, files and whether the diff was applied. Call it when you lose track of a task — after a restart or a ' +
+          'reset of your context — to find ids again for wait_task and apply_task_changes.',
+        inputSchema: {
+          type: 'object',
+          properties: { status: { type: 'string', description: 'Only tasks in this state: running, queued, done, failed or cancelled.' } },
+        },
+      },
+      {
         name: 'apply_task_changes',
         description:
           "Apply a finished task's diff to the user's working tree (unstaged). Only after you reviewed the diff from wait_task.",
@@ -601,9 +638,12 @@ export class DelegateServer implements vscode.Disposable {
       return text(ws.map((w) => `- ${w.id}: ${w.note} (${w.providerName}, model ${w.model})${w.agent ? w.noShell ? ' — agent tasks: edit-only, no shell; the lead runs checks' : ' — agent tasks: edits and commands' : ''}`).join('\n') || 'No workers are enabled.');
     }
     if (name === 'provider_usage') return text(await this.usageReport());
-    if (this.agents && ['start_task', 'wait_task', 'cancel_task', 'apply_task_changes'].includes(name)) {
+    if (this.agents && ['start_task', 'wait_task', 'cancel_task', 'apply_task_changes', 'list_tasks'].includes(name)) {
       try {
         const id = String(args.task_id ?? '');
+        if (name === 'list_tasks') {
+          return text(this.agents.listText(typeof args.status === 'string' && args.status ? args.status : undefined));
+        }
         if (name === 'start_task') {
           const routed = await this.route(args, 'agent');
           if ('error' in routed) return text(routed.error, true);
@@ -879,6 +919,36 @@ export class DelegateServer implements vscode.Disposable {
  * `mcpServers`. Read-modify-write with an atomic rename; leaves everything else
  * — Claude Code's own state — as it was, and never writes a file it can't parse.
  */
+interface Endpoint {
+  port: number;
+  token: string;
+  workerToken: string;
+}
+
+const ENDPOINT_FILE = 'cppo-endpoint.json';
+
+function readEndpoint(dir: string): Endpoint | undefined {
+  try {
+    const e = JSON.parse(fs.readFileSync(path.join(dir, ENDPOINT_FILE), 'utf-8')) as Partial<Endpoint>;
+    return Number.isInteger(e.port) && e.port! > 0 && e.port! < 65536 && typeof e.token === 'string' && /^[0-9a-f]{32,}$/.test(e.token) && typeof e.workerToken === 'string' && /^[0-9a-f]{32,}$/.test(e.workerToken)
+      ? (e as Endpoint)
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Owner-only, next to the .claude.json that already holds the lead token. */
+function saveEndpoint(dir: string, e: Endpoint): void {
+  try {
+    const tmp = path.join(dir, `${ENDPOINT_FILE}.${process.pid}.tmp`);
+    fs.writeFileSync(tmp, JSON.stringify(e), { mode: 0o600 });
+    fs.renameSync(tmp, path.join(dir, ENDPOINT_FILE));
+  } catch (err) {
+    log(`workers: could not keep the endpoint for the next restart — ${(err as Error).message}`);
+  }
+}
+
 function register(dir: string, entry: Json | undefined): void {
   const file = path.join(dir, '.claude.json');
   let config: Json = {};

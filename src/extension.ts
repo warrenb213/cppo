@@ -15,7 +15,7 @@ import { OrchestrationPanel } from './orchestration';
 import { DelegateServer } from './delegate';
 import { AgentTasks } from './agentTasks';
 import { Transcripts } from './transcripts';
-import { allWorkingDirs, workingRoot } from './workdir';
+import { allWorkingDirs, windowWorkingDir, workingRoot } from './workdir';
 import { removeStrayLinks } from './litellm';
 import { log, showLog } from './log';
 import { blockedByUnmarked, otherCopies, ownGeneration, stepAside, suggestRemoving } from './copies';
@@ -308,6 +308,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     return name ? registry.get(name)?.dir : undefined;
   });
   const agentTasks: AgentTasks = new AgentTasks(
+    windowWorkingDir(context),
     (id) => providers.agentSpec(id),
     (): { url: string; token: string } | undefined => workers.workerAccess(),
     (worker: string, inTok: number, outTok: number): void => workers.usage.count(worker, 'task', inTok, outTok)

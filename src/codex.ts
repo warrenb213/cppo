@@ -4,6 +4,7 @@ import * as os from 'os';
 import * as path from 'path';
 import { execFile, spawn } from 'child_process';
 import { log } from './log';
+import { LIMIT_SNIPPET } from './proc';
 import type { UsageEntry, UsageWindow } from './usage';
 
 /**
@@ -69,9 +70,14 @@ const ANSWER_ONLY_DISABLED = ['shell_tool', 'unified_exec', 'apps', 'plugins', '
 /** Agent tasks: Codex's own tools, minus what reaches beyond the worktree (desktop, browser, plugins). */
 export const AGENT_DISABLED = ['apps', 'plugins', 'browser_use', 'browser_use_external', 'in_app_browser', 'computer_use'];
 
-/** Shell arguments that run Codex with `args` through a login shell (the agent's commands see the user's PATH). */
-export function codexShellArgs(bin: string, args: string[]): string[] {
-  return ['-lc', 'exec "$0" "$@"', bin, ...args];
+/**
+ * Shell arguments that run Codex with `args` through a login shell (the agent's
+ * commands see the user's PATH). With `limitSec` the trampoline instead wraps
+ * the run in `timeout` (proc.ts LIMIT_SNIPPET) so a detached agent task ends at
+ * its wall even with no extension host watching; the caller sets CPPO_LIMIT_S.
+ */
+export function codexShellArgs(bin: string, args: string[], limitSec?: number): string[] {
+  return limitSec === undefined ? ['-lc', 'exec "$0" "$@"', bin, ...args] : ['-lc', LIMIT_SNIPPET, bin, ...args];
 }
 
 /** The OpenAI extension's bundled binary (`openai.chatgpt`), found by name under its bin/. */

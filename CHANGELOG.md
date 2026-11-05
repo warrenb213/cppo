@@ -1,5 +1,28 @@
 # Changelog
 
+## 1.21.0 — 2026-11-04
+
+### Fixed
+
+- **Agent tasks no longer get lost when the extension host restarts.** On one host, over two weeks, the lead asked for 14 task ids the extension no longer knew (7 at once in one incident), and 3 of 227 tasks vanished mid-run: tasks lived only in the extension host's memory, their processes hung off pipes to it, and `dispose()` killed running agents and deleted their worktrees. Every host restart — switching account or provider, *Reload Window*, an SSH reconnect, a crash — threw the work away, and an abrupt one left agents orphaned with nothing to collect them. Now:
+  - **Runs are detached** (own session) with their stream written straight to `log.jsonl`, and wrapped in `timeout` (their limit plus two minutes) so none can outlive its limit even with no one watching.
+  - **State is durable:** a `task.json` (owner-only, no secrets) beside the log, kept current. On startup the window's host **re-adopts** a running task (replaying the log to restore progress, then watching it for its remaining time), **collects** one that finished while it was away (the worktree is no longer deleted on dispose), and lists finished ones again — `wait_task` and `apply_task_changes` work across a restart, chains included.
+  - **Stopping works on the whole session** (via `/proc`), not just the leader's process group, because `timeout` moves its command to a group of its own.
+  - **The workers server keeps its port and tokens** across restarts (`cppo-endpoint.json`, owner-only, in the window's config folder), so a running Claude Code session reconnects to the same address and a re-adopted run can still consult other workers.
+  - An unknown task id now says why (another window, an older CPPO, too old) instead of "No task X in this window".
+  - Verified live against a real `agy` run: the "host" was killed with `kill -9` at step 8 of 30; the agent kept writing files with no host; a fresh host took over with its progress intact and delivered all 30 files.
+- **Failures are logged with their reason** (`failed (stopped at its 120-minute limit)`, …) — they used to be logged without one.
+- The idle limit for a silent run is 45 minutes, up from 20: a single long build or test run produces no output for as long as it runs.
+
+### Added
+
+- **`list_tasks`** (lead tool): this window's tasks, one line each — running and queued first, then finished newest first, with whether the diff was applied — so a lead that lost its ids (a restart, a reset of its context) can find them again.
+
+### Changed
+
+- Closing a window (or reloading it) no longer stops its running agent tasks. Cancel one with *Show Agent Tasks → Cancel* or `cancel_task`; otherwise it runs to its end or its limit and is collected when the window next opens.
+
+
 ## 1.20.0 — 2026-11-02
 
 ### Added
